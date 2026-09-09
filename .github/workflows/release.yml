@@ -80,7 +80,7 @@ jobs:
             -n cymphony \
             -v "$VERSION" \
             --architecture amd64 \
-            --description "Cymphony - Claude Code orchestrator" \
+            --description "Cymphony - multi-harness Linear coding-agent orchestrator" \
             --url "https://github.com/${{ github.repository }}" \
             --maintainer "Cymphony Authors" \
             --license "Apache-2.0" \
