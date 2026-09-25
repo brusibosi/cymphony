@@ -505,7 +505,6 @@ defmodule CymphonyElixirWeb.DashboardLive do
   @impl true
   def handle_event("reorder_queue", params, socket) do
     project_name = params["project"]
-    socket = optimistic_reorder_queue(socket, project_name, params["order"])
 
     case persist_queue_order(project_name, params["order"]) do
       :ok ->
@@ -1190,7 +1189,6 @@ defmodule CymphonyElixirWeb.DashboardLive do
                 >
                   <.queue_card
                     :for={{entry, rank} <- Enum.with_index(project_waiting(project))}
-                    :key={entry.issue_identifier}
                     project_name={project.name}
                     entry={entry}
                     rank={rank}
@@ -3002,31 +3000,6 @@ defmodule CymphonyElixirWeb.DashboardLive do
   end
 
   defp normalize_queue_order(_order), do: :error
-
-  defp optimistic_reorder_queue(socket, project_name, raw_order) do
-    order =
-      case normalize_queue_order(raw_order) do
-        :error -> []
-        list -> list
-      end
-
-    projects =
-      Enum.map(socket.assigns.projects, fn project ->
-        if project.name == project_name,
-          do: reorder_project_waiting(project, order),
-          else: project
-      end)
-
-    assign(socket, :projects, projects)
-  end
-
-  defp reorder_project_waiting(project, order) do
-    waiting = project_waiting(project)
-    by_id = Map.new(waiting, &{&1.issue_identifier, &1})
-    reordered = Enum.flat_map(order, &List.wrap(Map.get(by_id, &1)))
-    leftover = Enum.reject(waiting, &(&1.issue_identifier in order))
-    Map.put(project, :waiting, reordered ++ leftover)
-  end
 
   defp call_project_orchestrator(project_name, message) do
     pid = lookup_orchestrator(project_name)

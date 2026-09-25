@@ -113,6 +113,24 @@ defmodule CymphonyElixir.ExtensionsTest do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
 
+    def handle_call({:reorder_queue, order} = call, _from, state) when is_list(order) do
+      if recipient = Keyword.get(state, :recipient), do: send(recipient, {:orchestrator_call, call})
+
+      state =
+        if Keyword.get(state, :reorder_snapshot?) do
+          snapshot = Keyword.fetch!(state, :snapshot)
+          waiting = snapshot.waiting
+          by_identifier = Map.new(waiting, &{&1.identifier, &1})
+          reordered = Enum.flat_map(order, &List.wrap(Map.get(by_identifier, &1)))
+          leftover = Enum.reject(waiting, &(&1.identifier in order))
+          Keyword.put(state, :snapshot, %{snapshot | waiting: reordered ++ leftover})
+        else
+          state
+        end
+
+      {:reply, :ok, state}
+    end
+
     def handle_call(call, _from, state) do
       case Keyword.get(state, :recipient) do
         pid when is_pid(pid) -> send(pid, {:orchestrator_call, call})
@@ -1093,12 +1111,14 @@ defmodule CymphonyElixir.ExtensionsTest do
         StaticOrchestrator.start_link(
           name: orchestrator_name,
           snapshot: snapshot,
-          recipient: self()
+          recipient: self(),
+          reorder_snapshot?: true
         )
 
       start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
       {:ok, view, _html} = live(build_conn(), "/")
+      assert queue_card_order(view) == ["LLM-51", "LLM-12"]
 
       render_click(view, "reorder_queue", %{
         "project" => "default",
@@ -1107,6 +1127,26 @@ defmodule CymphonyElixir.ExtensionsTest do
 
       refute_received {:orchestrator_call, {:kill_issue, _}}
       assert_queue_orchestrator_call(:reorder_queue)
+
+      config_dir = Application.fetch_env!(:cymphony_elixir, :config_dir_override)
+      config = config_dir |> Path.join("config.json") |> File.read!() |> Jason.decode!()
+      assert get_in(config, ["projects", Access.at(0), "queue_order"]) == ["LLM-12", "LLM-51"]
+
+      assert_eventually(fn -> queue_card_order(view) == ["LLM-12", "LLM-51"] end)
+
+      rendered = render(view)
+      seq_before = :sys.get_state(view.pid).socket.assigns.payload_seq
+      send(view.pid, :reload_payload_now)
+
+      assert_eventually(fn ->
+        state = :sys.get_state(view.pid)
+
+        state.socket.assigns.payload_seq > seq_before and
+          state.socket.assigns.payload_job == nil and
+          queue_card_order(view) == ["LLM-12", "LLM-51"]
+      end)
+
+      assert render(view) == rendered
     end
 
     test "settings drawer renders orchestrator controls and display pref hooks" do
@@ -2454,6 +2494,14 @@ defmodule CymphonyElixir.ExtensionsTest do
           flunk("did not receive #{expected} orchestrator call")
         end
     end
+  end
+
+  defp queue_card_order(view) do
+    view
+    |> render()
+    |> Floki.parse_fragment!()
+    |> Floki.find("#queue-board-default > article.queue-card")
+    |> Enum.map(fn card -> card |> Floki.attribute("data-issue") |> List.first() end)
   end
 
   defp queue_control_exported?(:reorder_queue),
