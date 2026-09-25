@@ -112,10 +112,11 @@ defmodule CymphonyElixir.LinearApiTest do
     File.mkdir_p!(workflow_dir)
     workflow_path = Path.join(workflow_dir, "WORKFLOW.md")
     File.write!(workflow_path, WorkflowGenerator.generate(project))
+    store_name = ProjectSupervisor.via_tuple("Farm", :workflow_store)
 
     start_supervised!(%{
       id: {:failed_linear_rewrite_store, "Farm"},
-      start: {WorkflowStore, :start_link, [[name: ProjectSupervisor.via_tuple("Farm", :workflow_store), workflow_path: workflow_path]]}
+      start: {WorkflowStore, :start_link, [[name: store_name, workflow_path: workflow_path]]}
     })
 
     owner = self()

@@ -1,9 +1,9 @@
 defmodule CymphonyElixir.AgentOutputWindowTest do
   use ExUnit.Case, async: true
 
-  alias CymphonyElixir.Agent.OutputWindow
-  alias CymphonyElixir.Agent.Codex
   alias CymphonyElixir.Agent.Antigravity
+  alias CymphonyElixir.Agent.Codex
+  alias CymphonyElixir.Agent.OutputWindow
 
   test "a long Codex stream keeps thread ID, last message, completion usage and a bounded transcript" do
     thread = ~s({"type":"thread.started","thread_id":"thread-4900"})

@@ -191,7 +191,7 @@ All routes are under `/api/v1/` and require `?project=...` where shown. Successf
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/state` | Full orchestrator snapshot, including waiting, running, retrying and counts |
-| `GET` | `/projects` | Configured/running project summary |
+| `GET` | `/projects` | Configured/running project summary; `503 snapshot_unavailable` if projects exist but none can answer, versus `200 {"projects":[]}` for a truly empty fleet |
 | `POST` | `/projects` | Add and start a project without daemon restart |
 | `GET` / `POST` | `/linear` | Inspect Linear connection / validate and persist API key |
 | `GET` | `/linear/projects` | List accessible Linear projects after connecting |
@@ -236,7 +236,7 @@ For local Claude Code sessions with a Linear key, Cymphony writes `.cymphony/mcp
 - The stall watchdog defaults to 5 minutes of agent-event silence and is configurable per project with positive `agent.stall_timeout_ms`.
 - Retry attempts are counted only for genuine failures. Once the configured maximum is exceeded, Cymphony posts a bounded/redacted error comment, optionally changes state, and removes the workspace.
 - Terminal or non-active issues stop running agents. Terminal cleanup runs `before_remove` before deletion. Manual kill stops the session without deleting the workspace.
-- Workspace and harness output is streamed into bounded buffers; secrets are redacted from failure excerpts.
+- Workspace and harness output is streamed into bounded buffers; secrets are redacted from public event state, harness views, and failure excerpts. A single unterminated CLI line above 256 KiB is rejected; the Antigravity fallback text window is capped at 64 KiB with a truncation marker.
 
 ## How it works
 
@@ -248,7 +248,7 @@ Linear poll → eligible queue → run-spec resolution → worker selection
  workspace hooks → selected harness session → live stdout → completion/retry
 ```
 
-Each project supervisor owns a poll loop and orchestrator. The application supervisor starts Phoenix PubSub, the harness stream, completion store, task supervisor, dynamic project supervisors, HTTP endpoint, and terminal dashboard. `Queue.reconcile` owns sticky queue order; initial dispatch sorting uses Linear priority, creation time, and identifier.
+Each project and legacy runtime owns a workflow store, a separate port-guard supervisor, a task supervisor for agents and bounded I/O jobs, and an orchestrator under a restart barrier. Tracker/config calls run outside the orchestrator process; results are fenced against current state before dispatch. Local CLI, hook, and SSH-client process groups are reaped when their owner ends, but a detached remote process or SSH partition cannot be guaranteed exactly-once by local supervision. The application supervisor also starts Phoenix PubSub, the harness stream, completion store, dynamic project supervisors, HTTP endpoint, and terminal dashboard. `Queue.reconcile` owns sticky queue order; initial dispatch sorting uses Linear priority, creation time, and identifier.
 
 ## Logs and data locations
 
@@ -259,7 +259,7 @@ Each project supervisor owns a poll loop and orchestrator. The application super
 - `~/.cymphony/daemon.out` — background stdout/stderr, including early startup failures.
 - `~/.cymphony/workspaces/<project>/...` — default issue workspaces.
 
-Issue-related logs include both the Linear internal issue id and identifier; agent lifecycle logs include its session/thread/conversation id. Raw API keys and provider secrets are not logged.
+Issue-related logs include both the Linear internal issue id and identifier; agent lifecycle logs include its session/thread/conversation id. Public projections and failure excerpts redact known credential patterns. The host-local debug transcript intentionally retains raw agent output for diagnosis and may therefore contain secrets emitted by an agent or upstream CLI; protect access to `~/.cymphony/log/` accordingly.
 
 ## Development and tests
 

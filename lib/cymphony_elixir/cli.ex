@@ -657,23 +657,26 @@ defmodule CymphonyElixir.CLI do
       case LegacySupervisor.ensure_workflow_path(expanded_path) do
         :ok ->
           :ok = deps.set_workflow_file_path.(expanded_path)
-
-          case deps.ensure_all_started.() do
-            {:ok, _started_apps} ->
-              case Map.get(deps, :start_legacy_runtime, fn -> :ok end).() do
-                :ok -> :ok
-                {:error, reason} -> {:error, "Failed to start Cymphony with workflow #{expanded_path}: #{inspect(reason)}"}
-              end
-
-            {:error, reason} ->
-              {:error, "Failed to start Cymphony with workflow #{expanded_path}: #{inspect(reason)}"}
-          end
+          start_legacy_runtime(deps, expanded_path)
 
         {:error, {:already_running_with_workflow, running_path}} ->
           {:error, "Cymphony is already running with workflow #{running_path}; stop it before selecting #{expanded_path}"}
       end
     else
       {:error, "Workflow file not found: #{expanded_path}"}
+    end
+  end
+
+  defp start_legacy_runtime(deps, expanded_path) do
+    case deps.ensure_all_started.() do
+      {:ok, _started_apps} ->
+        case Map.get(deps, :start_legacy_runtime, fn -> :ok end).() do
+          :ok -> :ok
+          {:error, reason} -> {:error, "Failed to start Cymphony with workflow #{expanded_path}: #{inspect(reason)}"}
+        end
+
+      {:error, reason} ->
+        {:error, "Failed to start Cymphony with workflow #{expanded_path}: #{inspect(reason)}"}
     end
   end
 

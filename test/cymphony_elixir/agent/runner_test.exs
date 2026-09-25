@@ -1,6 +1,8 @@
 defmodule CymphonyElixir.Agent.RunnerTest do
   use CymphonyElixir.TestSupport
 
+  alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -473,8 +475,12 @@ defmodule CymphonyElixir.Agent.RunnerTest do
     trace = Path.join(root, "env.trace")
     previous_config_dir = Application.get_env(:cymphony_elixir, :config_dir_override)
     previous_shell_cmd = Application.get_env(:cymphony_elixir, :shell_provider_cmd)
+    previous_openai_api_key = System.get_env("OPENAI_API_KEY")
 
     try do
+      # The child inherits host environment. Isolate this variable so the
+      # assertion checks only that the other agent's config key was filtered.
+      System.delete_env("OPENAI_API_KEY")
       File.mkdir_p!(workspace)
       Application.put_env(:cymphony_elixir, :config_dir_override, root)
 
@@ -483,7 +489,7 @@ defmodule CymphonyElixir.Agent.RunnerTest do
       end)
 
       :ok =
-        CymphonyElixir.Cymphony.Config.save(%{
+        CymphonyConfig.save(%{
           "projects" => [],
           "providers" => %{
             "cz" => %{
@@ -506,12 +512,32 @@ defmodule CymphonyElixir.Agent.RunnerTest do
         claude_provider: "cz"
       )
 
-      issue = %Issue{id: "provider-map", identifier: "MT-CONFIG-PROVIDER", title: "Auth", description: "", state: "In Progress", url: "https://example.test/issue", labels: []}
+      issue = %Issue{
+        id: "provider-map",
+        identifier: "MT-CONFIG-PROVIDER",
+        title: "Auth",
+        description: "",
+        state: "In Progress",
+        url: "https://example.test/issue",
+        labels: []
+      }
+
       assert {:ok, %{session_id: "configured"}} = Runner.run(workspace, "go", issue)
       assert File.read!(trace) == "ANTHROPIC_API_KEY=from-config\nOPENAI_API_KEY=\n"
     after
-      if previous_config_dir, do: Application.put_env(:cymphony_elixir, :config_dir_override, previous_config_dir), else: Application.delete_env(:cymphony_elixir, :config_dir_override)
-      if previous_shell_cmd, do: Application.put_env(:cymphony_elixir, :shell_provider_cmd, previous_shell_cmd), else: Application.delete_env(:cymphony_elixir, :shell_provider_cmd)
+      if previous_config_dir do
+        Application.put_env(:cymphony_elixir, :config_dir_override, previous_config_dir)
+      else
+        Application.delete_env(:cymphony_elixir, :config_dir_override)
+      end
+
+      if previous_shell_cmd do
+        Application.put_env(:cymphony_elixir, :shell_provider_cmd, previous_shell_cmd)
+      else
+        Application.delete_env(:cymphony_elixir, :shell_provider_cmd)
+      end
+
+      restore_env("OPENAI_API_KEY", previous_openai_api_key)
       File.rm_rf(root)
     end
   end
@@ -550,6 +576,7 @@ defmodule CymphonyElixir.Agent.RunnerTest do
 
       File.write!(fake_ssh, """
       #!/bin/sh
+      IFS= read -r _guard_ready || exit 1
       printf '%s\\n' "$@" > "#{trace_file}"
       echo '{"result":"done","session_id":"sess-remote-env"}'
       """)

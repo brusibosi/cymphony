@@ -2471,8 +2471,14 @@ Enablement (extension):
     which put a whole project section — its Comboboxes included — on the wire for a single
     harness stdout line, at up to ~12 patches per second on an expanded row. Rows are function
     components (stalled alert, project agent controls, queue card, session row) whose attrs are
-    change-tracked individually, and the project / queue / session / retry comprehensions are
-    keyed so the diff is per row. A harness line must ship the harness pane and nothing else.
+    change-tracked individually. Project / queue / session / retry comprehensions are keyed for
+    per-row diffs. A keyed LiveView 1.1.33 reorder previously raised in `template_static`
+    because a rank-dependent Next badge changed the row's structural template; the badge now
+    remains in the template and hides outside rank 0. Stable card DOM IDs and the client
+    QueueBoard hook preserve immediate drag behavior, while the server waits for authoritative
+    state rather than optimistically reassigning `:projects`. A narrow per-project rendering
+    projection keeps header/editor controls out of single-card diffs. A harness line must ship
+    the harness pane and nothing else.
   - Acceptance: an idle dashboard ships no per-second diff; with sessions running and no real
     state change a payload load ships an **empty** diff (an empty diff is skipped entirely by
     the client, which is what leaves every input and every open dropdown alone) and reassigns
@@ -2587,7 +2593,9 @@ Minimum endpoints:
     resolved (file or env).
 - `POST /api/v1/projects`
   - Must be declared **before** the issue catch-all. `GET /api/v1/projects` (running
-    counts) is unchanged.
+    counts) is unchanged in shape. It returns a normal `200 {"projects":[]}` for a truly
+    empty fleet, but `503 snapshot_unavailable` when projects are registered and every
+    bounded snapshot read fails; never render that failure as an empty fleet.
   - Body `{"name":"...","linear_project_slug":"..."}` plus optional `github_repo_url`,
     `workspace_root`, `agent`, `model`, `effort`, `provider`.
   - Appends to `~/.cymphony/config.json`, writes a temp `WORKFLOW.md`, and starts the
@@ -2595,7 +2603,7 @@ Minimum endpoints:
   - `202` `{"name":"...","linear_project_slug":"...","started":true}` (never include the
     raw key).
   - `422` codes: `not_connected`, `invalid_project`, `duplicate_project_name`,
-    `duplicate_project_slug`, `project_start_failed`.
+    `duplicate_project_slug`, `project_workflow_failed`, `project_start_failed`.
 
 - `POST /api/v1/queue`
   - Must be declared (and `match :*` `405`) **before** `/api/v1/:issue_identifier`.
@@ -3165,39 +3173,37 @@ on_worker_exit(issue_id, reason, state):
   return state
 ```
 
+The following retry pseudocode is conceptual: network validation is a bounded
+runtime-owned intent, not a synchronous call inside the orchestrator. Its
+result is fenced against the current run/config generation and retry token.
+
 ```text
 on_retry_timer(issue_id, retry_token, state):
+  retry_entry = state.retry_attempts[issue_id]
+  if retry_entry is missing or retry_entry.retry_token != retry_token:
+    return state
+
   if state.paused:
     # Hold: same attempt, same failures, no timer, original due_at_ms.
-    # A stale retry_token is still ignored.
-    if state.retry_attempts[issue_id].retry_token == retry_token:
-      state.retry_attempts[issue_id].timer_ref = null
-      state.retry_attempts[issue_id].held = true
+    retry_entry.timer_ref = null
+    retry_entry.held = true
     return state
 
-  retry_entry = state.retry_attempts.pop(issue_id)
-  if missing:
+  # The claim and retry record remain owned until a real outcome.
+  return start_bounded_retry_validation_intent(issue_id, retry_entry)
+
+on_retry_intent_result(issue_id, retry_token, result, state):
+  if token_or_generation_is_stale(result, state):
     return state
-
-  candidates = tracker.fetch_candidate_issues()
-  if fetch failed:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: retry_entry.identifier,
-      error: "retry poll failed"
-    })
-
-  issue = find_by_id(candidates, issue_id)
-  if issue is null:
+  if result is refresh_error or current_worker_capacity_denies_dispatch:
+    return rearm_existing_retry_without_new_failure(state, issue_id)
+  if result is missing, terminal, or no_longer_active:
+    state.retry_attempts.remove(issue_id)
     state.claimed.remove(issue_id)
     return state
-
-  if available_slots(state) == 0:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: issue.identifier,
-      error: "no available orchestrator slots"
-    })
-
-  return dispatch_issue(issue, state, attempt=retry_entry.attempt)
+  if current_state_allows_dispatch(result.issue, state):
+    return dispatch_and_then_remove_retry_record(result.issue, state)
+  return rearm_or_hold_existing_retry(state, issue_id)
 ```
 
 ```text
@@ -3344,6 +3350,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Request/response read timeout is enforced
 - Turn timeout is enforced
 - Partial JSON lines are buffered until newline
+- An unterminated CLI line over 256 KiB is rejected before it can grow a port
+  buffer indefinitely; retained completed events use a bounded window that
+  preserves result/session/usage milestones (Antigravity fallback text capped
+  at 64 KiB with a truncation marker)
 - Stdout and stderr are handled separately; protocol JSON is parsed from stdout only
 - Non-JSON stderr lines are logged but do not crash parsing
 - Command/file-change approvals are handled according to the implementation's documented policy

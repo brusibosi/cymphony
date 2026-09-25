@@ -52,7 +52,7 @@ defmodule CymphonyElixirWeb.Control do
   @spec resume(scope()) :: :ok | {:error, :not_found | term()}
   def resume(scope), do: apply_scope(scope, &Orchestrator.resume/1, &persist_dispatch_paused(&1, false))
 
-  @spec set_concurrency(scope(), pos_integer()) :: :ok | {:error, :not_found}
+  @spec set_concurrency(scope(), pos_integer()) :: :ok | {:error, term()}
   def set_concurrency(scope, n) when is_integer(n) and n > 0 do
     apply_scope(
       scope,

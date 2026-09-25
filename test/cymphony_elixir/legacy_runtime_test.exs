@@ -61,7 +61,9 @@ defmodule CymphonyElixir.LegacyRuntimeTest do
     assert Workflow.workflow_file_path() == first_path
     assert WorkflowStore.path(Process.whereis(WorkflowStore)) == first_path
     assert {:ok, %{prompt: "First workflow"}} = WorkflowStore.current()
-    assert first_runtime == {Process.whereis(LegacySupervisor), Process.whereis(WorkflowStore), Process.whereis(Orchestrator)}
+
+    assert first_runtime ==
+             {Process.whereis(LegacySupervisor), Process.whereis(WorkflowStore), Process.whereis(Orchestrator)}
   end
 
   test "malformed legacy workflow returns a startup error without a runtime" do

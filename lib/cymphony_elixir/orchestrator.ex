@@ -2752,7 +2752,6 @@ defmodule CymphonyElixir.Orchestrator do
       {:ok, {apply_config_json_overrides(config, project_name), prompt_template}}
     else
       {:error, reason} -> {:error, reason}
-      other -> {:error, {:invalid_workflow, other}}
     end
   end
 
