@@ -88,12 +88,13 @@ defmodule CymphonyElixir.PublicEvent do
   defp sanitize_key(_key, budget), do: {nil, budget}
 
   defp sanitize_map_entry({key, nested}, {acc, budget}, depth) do
+    secret? = secret_key?(key)
     {public_key, budget} = sanitize_key(key, budget)
 
     if is_nil(public_key) do
       {acc, budget}
     else
-      value = if secret_key?(public_key), do: @redacted, else: nested
+      value = if secret?, do: @redacted, else: nested
       {public_value, budget} = sanitize(value, budget, depth + 1)
       {Map.put(acc, public_key, public_value), budget}
     end
@@ -102,7 +103,14 @@ defmodule CymphonyElixir.PublicEvent do
   defp secret_key?(key) when is_atom(key), do: secret_key?(Atom.to_string(key))
 
   defp secret_key?(key) when is_binary(key) do
-    assignment = key <> "=" <> @key_probe
-    Text.redact_secrets(assignment) != assignment
+    if byte_size(key) > @max_input_bytes do
+      true
+    else
+      name = key |> Text.scrub_invalid_utf8() |> Text.strip_ansi_and_control()
+      assignment = name <> "=" <> @key_probe
+      Text.redact_secrets(assignment) != assignment
+    end
   end
+
+  defp secret_key?(_key), do: false
 end

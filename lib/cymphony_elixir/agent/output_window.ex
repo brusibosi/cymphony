@@ -14,12 +14,14 @@ defmodule CymphonyElixir.Agent.OutputWindow do
   @max_tail_bytes 786_432
   @max_tail_lines 64
   @max_special_bytes 524_288
+  @max_antigravity_text_bytes 65_536
+  @truncated " [truncated]"
 
   @type t :: map()
 
   @spec new() :: t()
   def new do
-    %{next: 0, first: [], first_bytes: 0, tail: [], tail_bytes: 0, special: %{}}
+    %{next: 0, first: [], first_bytes: 0, tail: [], tail_bytes: 0, special: %{}, antigravity_step: nil}
   end
 
   @spec push(t(), binary()) :: t()
@@ -33,13 +35,22 @@ defmodule CymphonyElixir.Agent.OutputWindow do
     |> maybe_keep_first(entry, bytes)
     |> keep_tail(entry, bytes)
     |> maybe_keep_special(entry, bytes)
+    |> maybe_keep_antigravity_step(entry)
   end
 
   def push(window, _line), do: %{window | next: window.next + 1}
 
   @spec lines(t()) :: [binary()]
   def lines(window) do
-    (window.first ++ window.tail ++ Map.values(window.special))
+    entries = window.first ++ window.tail ++ Map.values(window.special)
+
+    entries =
+      case window.antigravity_step do
+        nil -> entries
+        step -> [antigravity_step_entry(step) | Enum.reject(entries, fn {_, line} -> antigravity_step_line?(line) end)]
+      end
+
+    entries
     |> Enum.uniq_by(&elem(&1, 0))
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.map(&elem(&1, 1))
@@ -101,6 +112,69 @@ defmodule CymphonyElixir.Agent.OutputWindow do
   defp classify_event(%{"type" => "result"}), do: :claude_result
   defp classify_event(%{"event" => "init"}), do: :antigravity_init
   defp classify_event(%{"event" => "result"}), do: :antigravity_result
-  defp classify_event(%{"event" => "step_update", "step_update" => %{"text_delta" => _}}), do: :antigravity_delta
   defp classify_event(_event), do: nil
+
+  defp maybe_keep_antigravity_step(window, {index, line}) do
+    case Jason.decode(line) do
+      {:ok, %{"event" => "step_update", "step_update" => %{} = step}} ->
+        summary =
+          window.antigravity_step ||
+            %{last_index: index, deltas_rev: [], text_bytes: 0, truncated?: false, usage: nil}
+
+        summary = summary |> keep_antigravity_delta(step) |> keep_antigravity_usage(step)
+        %{window | antigravity_step: %{summary | last_index: index}}
+
+      _ ->
+        window
+    end
+  end
+
+  defp keep_antigravity_delta(summary, %{"text_delta" => delta}) when is_binary(delta) do
+    remaining = max(@max_antigravity_text_bytes - summary.text_bytes, 0)
+    piece = CymphonyElixir.Text.truncate_trailing_bytes(delta, remaining)
+    deltas_rev = if piece == "", do: summary.deltas_rev, else: [piece | summary.deltas_rev]
+
+    %{
+      summary
+      | deltas_rev: deltas_rev,
+        text_bytes: summary.text_bytes + byte_size(piece),
+        truncated?: summary.truncated? or byte_size(piece) < byte_size(delta)
+    }
+  end
+
+  defp keep_antigravity_delta(summary, _step), do: summary
+
+  defp keep_antigravity_usage(summary, %{"usage" => %{} = usage}) do
+    allowed = ["input_tokens", "output_tokens", "total_tokens"]
+
+    public_usage =
+      usage
+      |> Map.take(allowed)
+      |> Map.new(fn {key, value} -> {key, bounded_usage_number(value)} end)
+
+    %{summary | usage: public_usage}
+  end
+
+  defp keep_antigravity_usage(summary, _step), do: summary
+
+  defp bounded_usage_number(value) when is_integer(value) and value >= 0 do
+    if :erlang.external_size(value) <= 64, do: value, else: 0
+  end
+
+  defp bounded_usage_number(_value), do: 0
+
+  defp antigravity_step_entry(summary) do
+    text = summary.deltas_rev |> Enum.reverse() |> IO.iodata_to_binary()
+    text = if summary.truncated?, do: text <> @truncated, else: text
+
+    step = %{}
+    step = if summary.deltas_rev == [], do: step, else: Map.put(step, "text_delta", text)
+    step = if is_map(summary.usage), do: Map.put(step, "usage", summary.usage), else: step
+
+    {summary.last_index, Jason.encode!(%{"event" => "step_update", "step_update" => step})}
+  end
+
+  defp antigravity_step_line?(line) do
+    match?({:ok, %{"event" => "step_update"}}, Jason.decode(line))
+  end
 end

@@ -64,7 +64,7 @@ defmodule CymphonyElixir.PublicEventTest do
     public = PublicEvent.sanitize(%{:"OPENAI_API_KEY=hidden-value" => "secret", type: "ready"})
 
     assert public[:type] == "ready"
-    assert public["OPENAI_API_KEY=[REDACTED]"] == "secret"
+    assert public["OPENAI_API_KEY=[REDACTED]"] == "[REDACTED]"
     refute inspect(public) =~ "hidden-value"
   end
 
@@ -105,5 +105,13 @@ defmodule CymphonyElixir.PublicEventTest do
     assert public["usage"] == nil
     assert public["normal"] == 42
     assert byte_size(:erlang.term_to_binary(public)) < 1_000
+  end
+
+  test "classifies a credential key before truncating its long name" do
+    key = String.duplicate("X", 1_100) <> "_API_KEY"
+    public = PublicEvent.sanitize(%{key => "opaque-secret"})
+
+    refute inspect(public) =~ "opaque-secret"
+    assert Map.values(public) == ["[REDACTED]"]
   end
 end
