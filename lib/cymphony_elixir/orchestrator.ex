@@ -14,6 +14,7 @@ defmodule CymphonyElixir.Orchestrator do
     Config,
     HarnessStream,
     ProjectSupervisor,
+    PublicEvent,
     RunSpecResolver,
     StatusDashboard,
     Tracker,
@@ -2067,19 +2068,19 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp agent_os_pid_for_update(_existing, %{agent_os_pid: pid})
        when is_binary(pid),
-       do: pid
+       do: PublicEvent.sanitize(pid)
 
   defp agent_os_pid_for_update(_existing, %{agent_os_pid: pid})
        when is_integer(pid),
-       do: Integer.to_string(pid)
+       do: pid |> Integer.to_string() |> PublicEvent.sanitize()
 
   defp agent_os_pid_for_update(_existing, %{agent_os_pid: pid}) when is_list(pid),
-    do: to_string(pid)
+    do: pid |> to_string() |> PublicEvent.sanitize()
 
   defp agent_os_pid_for_update(existing, _update), do: existing
 
   defp session_id_for_update(_existing, %{session_id: session_id}) when is_binary(session_id),
-    do: session_id
+    do: PublicEvent.sanitize(session_id)
 
   defp session_id_for_update(existing, _update), do: existing
 
@@ -2104,7 +2105,7 @@ defmodule CymphonyElixir.Orchestrator do
   defp summarize_agent_update(update) do
     %{
       event: update[:event],
-      message: update[:payload] || update[:raw],
+      message: PublicEvent.sanitize(update[:payload] || update[:raw]),
       timestamp: update[:timestamp]
     }
   end
@@ -2408,7 +2409,7 @@ defmodule CymphonyElixir.Orchestrator do
   defp apply_rate_limits(%State{} = state, update) when is_map(update) do
     case Tokens.extract_rate_limits(update) do
       %{} = rate_limits ->
-        %{state | rate_limits: rate_limits}
+        %{state | rate_limits: PublicEvent.sanitize(rate_limits)}
 
       _ ->
         state
@@ -2423,7 +2424,7 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp append_log_event(running_entry, event, message) when is_map(running_entry) do
     log_events = [
-      %{at: DateTime.utc_now(), event: event, message: message}
+      %{at: DateTime.utc_now(), event: event, message: PublicEvent.sanitize(message)}
       | Map.get(running_entry, :log_events, [])
     ]
 

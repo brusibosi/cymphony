@@ -12,11 +12,13 @@ defmodule CymphonyElixir.Agent.Runner do
   require Logger
 
   alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text, Workspace}
+  alias CymphonyElixir.Agent.OutputWindow
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
 
   @port_line_bytes 1_048_576
+  @max_retained_line_bytes 262_144
   @max_stream_log_bytes 1_000
   @harness_stdout_max 2048
   @port_eof_drain_ms 250
@@ -377,42 +379,57 @@ defmodule CymphonyElixir.Agent.Runner do
   end
 
   defp collect_output(port, config, on_message) do
-    collect_output(port, "", [], config, on_message, false)
+    collect_output(port, "", OutputWindow.new(), config, on_message, false)
   end
 
-  # Tail-recursive: accumulates completed lines in reverse and reverses once at
-  # the end, so a long streaming turn (thousands of events) does not grow the
-  # call stack proportionally to the number of output lines.
+  # Tail-recursive: completed lines enter a finite output window rather than
+  # accumulating an entire multi-hour stream in process state.
   # EP-STREAM: emit :harness_stdout incrementally for completed lines (and a
   # leftover buffer on exit 0). :noeol chunks stay buffered and are not emitted.
   # parse_output still runs only after a successful exit.
   # exit_status can race ahead of the last {:noeol, _} chunk; wait for :eof
   # (or a short drain) so leftover output is not dropped.
-  defp collect_output(port, buffer, acc, config, on_message, eof?) do
+  defp collect_output(port, buffer, window, config, on_message, eof?) do
     timeout_ms = if config, do: config.agent.turn_timeout_ms, else: Config.settings!().agent.turn_timeout_ms
 
     receive do
       {^port, {:data, {:eol, chunk}}} ->
-        line = buffer <> to_string(chunk)
-        log_stream_line(line)
-        emit_harness_stdout(on_message, line)
-        collect_output(port, "", [line | acc], config, on_message, eof?)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, line} ->
+            log_stream_line(line)
+            emit_harness_stdout(on_message, line)
+            collect_output(port, "", OutputWindow.push(window, line), config, on_message, eof?)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        collect_output(port, buffer <> to_string(chunk), acc, config, on_message, eof?)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, next_buffer} ->
+            collect_output(port, next_buffer, window, config, on_message, eof?)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, :eof} ->
-        collect_output(port, buffer, acc, config, on_message, true)
+        collect_output(port, buffer, window, config, on_message, true)
 
       {^port, {:exit_status, status}} ->
-        {buffer, acc} =
+        drained =
           if eof? do
-            {buffer, acc}
+            {:ok, buffer, window}
           else
-            drain_port_until_eof(port, buffer, acc, on_message)
+            drain_port_until_eof(port, buffer, window, on_message)
           end
 
-        finalize_collected_output(status, buffer, acc, on_message)
+        case drained do
+          {:ok, buffer, window} -> finalize_collected_output(status, buffer, window, on_message)
+          {:error, _} = error -> error
+        end
     after
       timeout_ms ->
         stop_port(port)
@@ -420,26 +437,49 @@ defmodule CymphonyElixir.Agent.Runner do
     end
   end
 
-  defp drain_port_until_eof(port, buffer, acc, on_message) do
+  defp drain_port_until_eof(port, buffer, window, on_message) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
-        line = buffer <> to_string(chunk)
-        log_stream_line(line)
-        emit_harness_stdout(on_message, line)
-        drain_port_until_eof(port, "", [line | acc], on_message)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, line} ->
+            log_stream_line(line)
+            emit_harness_stdout(on_message, line)
+            drain_port_until_eof(port, "", OutputWindow.push(window, line), on_message)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        drain_port_until_eof(port, buffer <> to_string(chunk), acc, on_message)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, next_buffer} ->
+            drain_port_until_eof(port, next_buffer, window, on_message)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, :eof} ->
-        {buffer, acc}
+        {:ok, buffer, window}
     after
       @port_eof_drain_ms ->
-        {buffer, acc}
+        {:ok, buffer, window}
     end
   end
 
-  defp finalize_collected_output(0, buffer, acc, on_message) do
+  defp append_output_chunk(buffer, chunk) do
+    chunk = to_string(chunk)
+
+    if byte_size(buffer) + byte_size(chunk) <= @max_retained_line_bytes do
+      {:ok, buffer <> chunk}
+    else
+      {:error, :agent_output_line_too_large}
+    end
+  end
+
+  defp finalize_collected_output(0, buffer, window, on_message) do
     remaining = buffer |> to_string() |> String.trim()
 
     if remaining != "" do
@@ -447,14 +487,14 @@ defmodule CymphonyElixir.Agent.Runner do
       emit_harness_stdout(on_message, remaining)
     end
 
-    lines = if remaining != "", do: [remaining | acc], else: acc
-    {:ok, Enum.reverse(lines)}
+    window = if remaining != "", do: OutputWindow.push(window, remaining), else: window
+    {:ok, OutputWindow.lines(window)}
   end
 
-  defp finalize_collected_output(status, buffer, acc, _on_message) do
+  defp finalize_collected_output(status, buffer, window, _on_message) do
     remaining = buffer |> to_string() |> String.trim()
     if remaining != "", do: log_stream_line(remaining)
-    {:error, {:agent_exit, status, failure_tail(acc, remaining)}}
+    {:error, {:agent_exit, status, failure_tail(window, remaining)}}
   end
 
   # A CLI that rejects its arguments prints a complete, newline-terminated
@@ -475,9 +515,9 @@ defmodule CymphonyElixir.Agent.Runner do
   # entry stores, `/api/v1/state` serves, the dashboard renders, and the tracker
   # abandonment comment publishes. `Agent.failure_excerpt/1` owns the bounding,
   # sanitizing, and redacting so the adapters' own exit-0 error payloads get
-  # exactly the same treatment. `acc` is already newest-first.
-  defp failure_tail(acc, remaining) do
-    Agent.failure_excerpt([remaining | acc])
+  # exactly the same treatment. The window is chronological, so reverse it.
+  defp failure_tail(window, remaining) do
+    Agent.failure_excerpt([remaining | Enum.reverse(OutputWindow.lines(window))])
   end
 
   # The harness ring is served by `GET /api/v1/:issue/harness` and rendered in
