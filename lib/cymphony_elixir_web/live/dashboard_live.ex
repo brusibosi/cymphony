@@ -111,6 +111,9 @@ defmodule CymphonyElixirWeb.DashboardLive do
       |> assign(:add_project_name, "")
       |> assign(:add_project_github, "")
       |> assign(:payload_seq, 0)
+      |> assign(:payload_generation, 0)
+      |> assign(:payload_job, nil)
+      |> assign(:payload_pending?, false)
 
     if connected? do
       schedule_runtime_tick()
@@ -382,7 +385,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
          socket
          |> assign(:linear_status, status)
          |> assign(:linear_error, nil)
-         |> assign(:payload_seq, next_payload_seq(socket))
+         |> reload_payload_now()
          |> put_flash(:info, "Linear connected · #{status.masked_key}")}
 
       {:error, {:workflow_rewrite_failed, _project, _reason} = reason} ->
@@ -393,7 +396,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
          socket
          |> assign(:linear_status, Control.linear_status())
          |> assign(:linear_error, message)
-         |> assign(:payload_seq, next_payload_seq(socket))
+         |> reload_payload_now()
          |> put_flash(:error, message)}
 
       {:error, reason} ->
@@ -626,10 +629,15 @@ defmodule CymphonyElixirWeb.DashboardLive do
     socket =
       if elapsed >= refresh_ms and
            (socket.assigns[:payload_dirty] == true or elapsed >= @idle_resync_ms) do
-        socket
-        |> spawn_payload_load()
-        |> assign(:payload_dirty, false)
-        |> assign(:last_payload_refresh, now)
+        requested = spawn_payload_load(socket)
+
+        if requested.assigns.payload_job do
+          requested
+          |> assign(:payload_dirty, false)
+          |> assign(:last_payload_refresh, now)
+        else
+          requested
+        end
       else
         socket
       end
@@ -639,17 +647,54 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info({:payload_loaded, seq, payload}, socket) when is_integer(seq) do
-    if seq != socket.assigns.payload_seq do
+    if seq != socket.assigns.payload_seq or socket.assigns.payload_job != nil do
       {:noreply, socket}
     else
-      token_samples = update_token_samples(socket.assigns.token_samples, payload)
-
-      {:noreply,
-       socket
-       |> assign_payload_sections(payload)
-       |> assign_token_throughput(token_samples)
-       |> update(:agent_setting_drafts, &prune_agent_drafts(&1, payload))}
+      {:noreply, apply_payload(socket, payload, false)}
     end
+  end
+
+  @impl true
+  def handle_info({ref, payload}, %{assigns: %{payload_job: %{ref: ref} = job}} = socket)
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    Process.cancel_timer(job.timer_ref)
+    socket = assign(socket, :payload_job, nil)
+
+    socket =
+      if job.generation == socket.assigns.payload_generation do
+        apply_payload(socket, payload)
+      else
+        socket
+      end
+
+    {:noreply, service_pending_payload(socket)}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{assigns: %{payload_job: %{ref: ref} = job}} = socket) do
+    Process.cancel_timer(job.timer_ref)
+
+    socket =
+      socket
+      |> assign(:payload_job, nil)
+      |> assign(:payload_dirty, true)
+      |> service_pending_payload()
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_info({:payload_timeout, ref, generation}, %{assigns: %{payload_job: %{ref: ref, generation: generation} = job}} = socket) do
+    Task.shutdown(job.task, :brutal_kill)
+
+    socket =
+      socket
+      |> assign(:payload_job, nil)
+      |> assign(:payload_dirty, true)
+      |> service_pending_payload()
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -678,6 +723,16 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info(_msg, socket), do: {:noreply, socket}
+
+  @impl true
+  def terminate(_reason, socket) do
+    if job = socket.assigns[:payload_job] do
+      Process.cancel_timer(job.timer_ref)
+      Task.shutdown(job.task, :brutal_kill)
+    end
+
+    :ok
+  end
 
   @impl true
   def render(assigns) do
@@ -1515,32 +1570,92 @@ defmodule CymphonyElixirWeb.DashboardLive do
   end
 
   defp spawn_payload_load(socket) do
-    seq = next_payload_seq(socket)
-    pid = self()
-
-    Task.Supervisor.start_child(CymphonyElixir.TaskSupervisor, fn ->
-      send(pid, {:payload_loaded, seq, load_payload()})
-    end)
-
-    assign(socket, :payload_seq, seq)
+    request_payload_load(socket, :periodic)
   end
 
-  # Use after a state-changing operation so the next render already shows the
-  # updated value, not the previous one. Async refresh is fine for periodic
-  # ticks but causes a one-frame flash of stale data on form submits.
+  # State-changing operations invalidate an in-flight pre-action read. Keep the
+  # last good payload until a post-action read applies, rather than rendering a
+  # stale intermediate result or blocking the LiveView on snapshot I/O.
   defp reload_payload_now(socket) do
+    request_payload_load(socket, :action)
+  end
+
+  defp request_payload_load(socket, priority) do
+    socket =
+      if priority == :action,
+        do: assign(socket, :payload_generation, socket.assigns.payload_generation + 1),
+        else: socket
+
+    if socket.assigns.payload_job do
+      assign(socket, :payload_pending?, true)
+    else
+      start_payload_load(socket)
+    end
+  end
+
+  defp start_payload_load(socket) do
+    generation = socket.assigns.payload_generation
     seq = next_payload_seq(socket)
-    payload = load_payload()
+    owner = self()
+
+    try do
+      task =
+        Task.Supervisor.async_nolink(CymphonyElixir.TaskSupervisor, fn ->
+          worker = self()
+
+          spawn(fn ->
+            owner_ref = Process.monitor(owner)
+            worker_ref = Process.monitor(worker)
+
+            receive do
+              {:DOWN, ^owner_ref, :process, _pid, _reason} -> Process.exit(worker, :kill)
+              {:DOWN, ^worker_ref, :process, _pid, _reason} -> :ok
+            end
+          end)
+
+          load_payload()
+        end)
+
+      timer_ref = Process.send_after(self(), {:payload_timeout, task.ref, generation}, snapshot_timeout_ms() + 1_000)
+
+      socket
+      |> assign(:payload_job, %{task: task, ref: task.ref, pid: task.pid, generation: generation, timer_ref: timer_ref})
+      |> assign(:payload_seq, seq)
+      |> assign(:payload_pending?, false)
+    rescue
+      _error ->
+        socket
+        |> assign(:payload_dirty, true)
+        |> assign(:last_payload_refresh, System.monotonic_time(:millisecond))
+    catch
+      :exit, _reason ->
+        socket
+        |> assign(:payload_dirty, true)
+        |> assign(:last_payload_refresh, System.monotonic_time(:millisecond))
+    end
+  end
+
+  defp service_pending_payload(socket) do
+    if socket.assigns.payload_pending? do
+      start_payload_load(assign(socket, :payload_pending?, false))
+    else
+      socket
+    end
+  end
+
+  defp apply_payload(socket, payload, refresh? \\ true) do
     token_samples = update_token_samples(socket.assigns.token_samples, payload)
 
     socket
-    |> assign(:payload_seq, seq)
     |> assign_payload_sections(payload)
     |> assign_token_throughput(token_samples)
     |> assign(:payload_dirty, false)
-    |> assign(:last_payload_refresh, System.monotonic_time(:millisecond))
+    |> maybe_stamp_payload_refresh(refresh?)
     |> update(:agent_setting_drafts, &prune_agent_drafts(&1, payload))
   end
+
+  defp maybe_stamp_payload_refresh(socket, true), do: assign(socket, :last_payload_refresh, System.monotonic_time(:millisecond))
+  defp maybe_stamp_payload_refresh(socket, false), do: socket
 
   defp next_payload_seq(socket), do: (socket.assigns[:payload_seq] || 0) + 1
 

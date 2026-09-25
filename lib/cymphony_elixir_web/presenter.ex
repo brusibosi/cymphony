@@ -9,11 +9,14 @@ defmodule CymphonyElixirWeb.Presenter do
   def state_payload(orchestrator, snapshot_timeout_ms) do
     generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
-    project_snapshots = aggregate_project_snapshots(snapshot_timeout_ms)
+    {project_count, project_snapshots} = aggregate_project_snapshots(snapshot_timeout_ms)
 
     case project_snapshots do
-      [] ->
+      [] when project_count == 0 ->
         legacy_payload(orchestrator, snapshot_timeout_ms, generated_at)
+
+      [] ->
+        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
 
       snapshots ->
         merged = merge_project_snapshots(snapshots)
@@ -92,19 +95,14 @@ defmodule CymphonyElixirWeb.Presenter do
 
   @spec projects_payload() :: [map()]
   def projects_payload do
-    ProjectSupervisor.list_orchestrators()
-    |> Enum.map(fn {project_name, pid} ->
-      case Orchestrator.snapshot(pid, 5_000) do
-        %{} = snapshot ->
-          %{
-            name: project_name,
-            running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
-          }
+    {_count, snapshots} = aggregate_project_snapshots(5_000)
 
-        _ ->
-          %{name: project_name, running: 0, retrying: 0}
-      end
+    Enum.map(snapshots, fn %{project_name: project_name, snapshot: snapshot} ->
+      %{
+        name: project_name,
+        running: length(snapshot.running),
+        retrying: length(snapshot.retrying)
+      }
     end)
   end
 
@@ -611,21 +609,65 @@ defmodule CymphonyElixirWeb.Presenter do
   end
 
   defp aggregate_project_snapshots(snapshot_timeout_ms) do
-    ProjectSupervisor.list_orchestrators()
-    |> Enum.flat_map(fn {project_name, pid} ->
-      try do
-        case Orchestrator.snapshot(pid, snapshot_timeout_ms) do
-          %{} = snapshot ->
-            [%{project_name: project_name, snapshot: snapshot}]
+    projects = ProjectSupervisor.list_orchestrators()
+    deadline = System.monotonic_time(:millisecond) + snapshot_timeout_ms
 
-          _ ->
-            []
-        end
-      catch
-        :exit, _ -> []
-      end
-    end)
+    snapshots =
+      projects
+      |> Enum.with_index()
+      |> collect_project_snapshots(%{}, [], deadline)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(&elem(&1, 1))
+
+    {length(projects), snapshots}
   end
+
+  defp collect_project_snapshots(queued, active, results, deadline) do
+    {queued, active} = start_snapshot_tasks(queued, active, deadline)
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if map_size(active) == 0 or remaining <= 0 do
+      Enum.each(active, fn {_ref, {task, _index, _name}} -> Task.shutdown(task, :brutal_kill) end)
+      results
+    else
+      receive do
+        {ref, snapshot} when is_map_key(active, ref) ->
+          {_task, index, name} = Map.fetch!(active, ref)
+          Process.demonitor(ref, [:flush])
+
+          results =
+            if is_map(snapshot),
+              do: [{index, %{project_name: name, snapshot: snapshot}} | results],
+              else: results
+
+          collect_project_snapshots(queued, Map.delete(active, ref), results, deadline)
+
+        {:DOWN, ref, :process, _pid, _reason} when is_map_key(active, ref) ->
+          collect_project_snapshots(queued, Map.delete(active, ref), results, deadline)
+      after
+        remaining ->
+          Enum.each(active, fn {_ref, {task, _index, _name}} -> Task.shutdown(task, :brutal_kill) end)
+          results
+      end
+    end
+  end
+
+  defp start_snapshot_tasks([{{name, pid}, index} | rest], active, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if map_size(active) < 4 and remaining > 0 do
+      task =
+        Task.Supervisor.async_nolink(CymphonyElixir.TaskSupervisor, fn ->
+          Orchestrator.snapshot(pid, remaining)
+        end)
+
+      start_snapshot_tasks(rest, Map.put(active, task.ref, {task, index, name}), deadline)
+    else
+      {[{{name, pid}, index} | rest], active}
+    end
+  end
+
+  defp start_snapshot_tasks(queued, active, _deadline), do: {queued, active}
 
   defp merge_project_snapshots(snapshots) do
     all_running =
