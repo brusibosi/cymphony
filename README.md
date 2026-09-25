@@ -4,27 +4,46 @@ Cymphony is a self-hosted Elixir/OTP service that turns Linear issues into super
 
 Cymphony is **not tied to one coding agent**. The current built-in harnesses are:
 
-| Harness | Command | Models / effort | Provider environment |
+| Harness | Command | Model picker / effort | Provider environment |
 |---|---|---|---|
 | Claude Code | `claude` | `sonnet`, `opus`, `haiku`; effort is passed through | `ANTHROPIC_*`, `CLAUDE_CODE_*`, `API_TIMEOUT`; fallback `ANTHROPIC_API_KEY` |
-| Codex CLI | `codex` | live `codex debug models` catalog with fallback models; per-model reasoning levels | `OPENAI_*`, `CODEX_*`, `API_TIMEOUT`; fallback `OPENAI_API_KEY` |
-| Antigravity CLI | `agy` | Gemini/CLI-Proxy model slugs such as `gemini-3.7-flash-high`; reasoning is encoded in the slug | `ANTIGRAVITY_*`, `GOOGLE_*`, `GEMINI_*`, `API_TIMEOUT`; fallback `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| Codex CLI | `codex` | live `codex debug models` catalog (bundled/static fallback); per-model reasoning levels | `OPENAI_*`, `CODEX_*`, `API_TIMEOUT`; fallback `OPENAI_API_KEY` |
+| Antigravity CLI | `agy` | static catalog of Gemini/CLI-Proxy slugs such as `gemini-3.7-flash-high`; reasoning is encoded in the slug | `ANTIGRAVITY_*`, `GOOGLE_*`, `GEMINI_*`, `API_TIMEOUT`; fallback `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 
-These are the supported kinds returned by `CymphonyElixir.Agent.known_kinds/0`: `claude`, `codex`, and `antigravity`. Other harnesses are not silently treated as supported. A named provider is only selected for the matching harness; without one, the selected harness may use its normal inherited fallback credentials. Cymphony does not log raw credentials.
+These are the supported kinds returned by `CymphonyElixir.Agent.known_kinds/0`: `claude`, `codex`, and `antigravity`. Other harnesses are not silently treated as supported. Model names shown here and below are examples from the source catalog, not a guarantee that a particular installed CLI or provider accepts them. A named provider is only selected for the matching harness; without one, the selected harness may use its normal inherited fallback credentials. Public dashboard/API projections and failure excerpts redact recognized secrets, but the **host-local debug transcript intentionally retains raw agent output** and may contain credentials.
 
 > **Preview software:** run it only against repositories and credentials you trust. An agent can edit code, run commands, and push branches according to your workflow.
+
+**Release status (2026-09-25):** This README describes current `main`. The latest published package is v2.8.2 (2026-08-18); it predates the unreleased hardening and behavior documented here, although `main` still reports version `2.8.2`. Build from source for current-`main` behavior; do not assume the published v2.8.2 binaries include it.
 
 ## What it does
 
 - Watches one or many Linear projects in one daemon.
 - Dispatches active issues into persistent, per-issue workspaces under the configured workspace root.
 - Runs Claude Code, Codex CLI, or Antigravity CLI through one normalized agent interface.
-- Supports per-project defaults and per-issue overrides from Linear labels or a `cymphony:` description directive.
+- Supports per-project defaults and per-issue overrides from queue pins, Linear labels, or a `cymphony:` description directive.
 - Resumes an active issue in the same workspace and agent session for continuation turns (up to `agent.max_turns`).
-- Retries failed or stalled runs with backoff; after `max_retry_attempts`, comments on the issue, optionally moves it to `agent.failure_state`, and cleans up.
+- Retries failed or stalled runs with backoff; after the configured consecutive-failure budget is exceeded, comments on the issue, optionally moves it to `agent.failure_state`, and cleans up.
 - Provides a Phoenix LiveView dashboard, terminal status dashboard, JSON API, live harness stdout, pause/resume, kill/retry, concurrency controls, and recent completion history.
-- Supports optional SSH workers, worker capacity limits, lifecycle hooks, retention sweeps, and Linear MCP integration for Claude Code.
+- Supports optional SSH workers, worker capacity limits, lifecycle hooks, retention sweeps, and local Linear MCP integration for Claude Code and Codex.
 - Stores runtime project configuration in `~/.cymphony/config.json` and generates owner-only (`0600`) per-project `WORKFLOW.md` files.
+
+## Screenshots
+
+Captured **2026-09-25** from application source `2cdd8e3` in ego lite. These are real dashboard renders with **fictional example data**, not production activity, performance benchmarks, or provider/model availability claims. Subsequent test/documentation updates do not change the pictured UI.
+
+**Advanced overview — dark theme:** multi-project queues, three harnesses, concurrency controls, retry/held state, and completions.
+
+![Current Cymphony advanced dashboard with example multi-project activity](.github/media/webui.png)
+
+<details>
+<summary>Expanded session and live harness output — light theme</summary>
+
+![Current Cymphony session details and live harness output with example data](.github/media/webui-session.png)
+
+</details>
+
+[Capture provenance](.github/media/README.md). The UI still displays the source version `2.8.2`; these screenshots include unreleased `main` changes, not just the published v2.8.2 binary.
 
 ## Install
 
@@ -126,26 +145,39 @@ Set project defaults in the wizard, dashboard, API, or `config.json`:
       "agent": "codex",
       "model": "gpt-5.2-codex",
       "effort": "high",
-      "providers": ["codex-work"]
+      "providers": ["codex_work"]
     }
   ]
 }
 ```
 
-At dispatch time, each field is resolved independently in this order:
+At dispatch time, `agent`, `model`, and `effort` are resolved independently in this order for a waiting queue card:
 
-1. Linear labels: `agent:<kind>`, `model:<name>`, `effort:<level>`, `provider:<alias>`.
-2. The first matching directive line in the description, for example:
+1. A saved queue-card pin (`agent_kind`, `model`, or `effort`), if present.
+2. Linear labels: `agent:<kind>`, `model:<name>`, `effort:<level>`.
+3. The first matching directive line in the description, for example:
    `cymphony: agent=antigravity model=gemini-3.7-flash-high`.
-3. The project configuration/defaults.
+4. The project configuration/defaults.
 
-An unknown agent kind is ignored and falls back to the next source. The resolved spec is pinned for that run attempt; changing configuration does not mutate an already-running session.
+Provider selection has no queue-card pin: an explicit per-session provider override wins, then a `provider:<alias>` label, a description directive, and finally rotation from the selected kind's project provider list. A running-session restart override can supersede queue pins; pins win for ordinary waiting-card dispatch. An unknown agent kind is ignored and falls back to the next source. The resolved spec is pinned for that run attempt; changing configuration does not mutate an already-running session.
 
 Antigravity does not receive `--effort`: its model slug carries the reasoning level. Codex uses `-c model_reasoning_effort=...`; Claude receives `--effort` when supplied.
 
 ## Providers
 
-A provider is a named environment switch, not a second harness. Provider names are resolved from shell functions whose names start with lowercase `c` (excluding `claude`, `codex`, `agy`, and `antigravity`). Cymphony sources `~/.cld`, then `.zshrc`/`.bashrc`, invokes the selected function in a subprocess, captures only the selected harness's environment prefixes, and caches the result for the daemon lifetime.
+A provider is a named environment switch, not a second harness. Define a top-level `providers` environment map in `~/.cymphony/config.json`, or define a shell function in `~/.cld`, `~/.zshrc`, or `~/.bashrc`. A config-map entry takes precedence; both forms filter values to the active harness's environment prefixes. Shell aliases must be safe function identifiers (`[A-Za-z_][A-Za-z0-9_]*`); they **do not** need to start with `c`. The auto-discovery list shown by onboarding is narrower and lists lowercase `c…` functions only. Shell functions run in a zsh subprocess and their filtered results are cached for the daemon lifetime.
+
+Example top-level config-map entry (merge alongside `projects`):
+
+```json
+{
+  "providers": {
+    "codex_work": {"OPENAI_API_KEY": "<secret>", "OPENAI_BASE_URL": "https://api.example.test/v1"}
+  }
+}
+```
+
+The real config file contains secrets; keep it private (`0600`).
 
 Example `~/.cld`:
 
@@ -178,7 +210,7 @@ Start with `cymphony port 4089`. The LiveView dashboard has Simple and Advanced 
 - Each project has durable pause/resume, concurrency, a harness/model/effort switcher, Claude-only provider controls, and counts in the form `N/M running · Q queued · R retrying`.
 - **Queue board** appears above In Progress. It contains eligible waiting issues that are not running or retrying. Dragging persists operator order in `queue_order`; queue pins persist agent/model/effort in `queue_pins`. Cymphony rank is the row-major queue index, not Linear priority. Queue-card edits do not kill a run or write to Linear.
 - Expanded sessions include live `HarnessStream` stdout with Follow/Paused controls, runtime, workspace/worker/log data, and restart overrides. Agent kinds are shown with icons.
-- Retry remains below In Progress. A manual retry releases a queued retry immediately; automatic retries use backoff and preserve failure context.
+- Retry remains below In Progress. A manual retry is an explicit override, including while paused. Automatic retries use backoff and preserve failure context; a timer due during pause is held without consuming another attempt, then released immediately on resume.
 - Recent completions are persisted in `~/.cymphony/sessions.db` (up to 100 per project in the dashboard; the API supports larger bounded queries).
 - Settings provides Linear connect, searchable Linear-project add, project defaults, pause/concurrency controls, display visibility, and dashboard payload refresh seconds (default `3`, minimum `1`). Dashboard refresh is separate from the Linear polling interval.
 
@@ -227,16 +259,17 @@ Agent and hook commands run inside the issue workspace. Workspace paths are chec
 
 ### Linear MCP
 
-For local Claude Code sessions with a Linear key, Cymphony writes `.cymphony/mcp_config.json` inside the workspace with mode `0600` and starts the `cymphony-linear` MCP server. The key is placed in the MCP process environment, not in the command line. Remote SSH sessions do not inject the local MCP descriptor.
+For local sessions with a Linear key, Cymphony offers the `cymphony-linear` MCP server to Claude Code and Codex. Claude receives a workspace `.cymphony/mcp_config.json` descriptor (mode `0600`); Codex receives CLI config overrides that inherit `LINEAR_API_KEY` from its process environment. Neither puts the key on the command line. Remote SSH sessions do not inject the local MCP descriptor.
 
 ## Retry, continuation, and safety behavior
 
 - A normal turn that leaves the issue active causes a continuation turn in the same agent session; the runner re-fetches issue state before continuing.
 - An agent failure retries after exponential backoff starting at 10 seconds, capped by `agent.max_retry_backoff_ms` (default 300 seconds). A continuation retry uses a 1-second delay.
 - The stall watchdog defaults to 5 minutes of agent-event silence and is configurable per project with positive `agent.stall_timeout_ms`.
-- Retry attempts are counted only for genuine failures. Once the configured maximum is exceeded, Cymphony posts a bounded/redacted error comment, optionally changes state, and removes the workspace.
+- In `config.json`, `stall_timeout_ms` is a positive-integer project key; invalid/nonpositive values fall back to 5 minutes. Operator-authored `extra_args` can be a string list or a map of per-kind string lists, and only the active kind is emitted into generated workflow front matter. Antigravity defaults to `--new-project` and writes its CLI log beside the workspace; only an explicit project `new_project: false` removes that flag.
+- Genuine consecutive failures count toward `agent.max_retry_attempts` (default 30). Once that budget is exceeded, Cymphony posts a bounded/redacted error comment, optionally changes state, and removes the workspace. A pause-held retry keeps its attempt/failure count; an explicit manual retry remains available while paused.
 - Terminal or non-active issues stop running agents. Terminal cleanup runs `before_remove` before deletion. Manual kill stops the session without deleting the workspace.
-- Workspace and harness output is streamed into bounded buffers; secrets are redacted from public event state, harness views, and failure excerpts. A single unterminated CLI line above 256 KiB is rejected; the Antigravity fallback text window is capped at 64 KiB with a truncation marker.
+- Workspace and harness output is streamed into bounded buffers; recognized secrets are redacted from public event state, harness views, and failure excerpts. This is not a general secret scanner: unnamed values without a known pattern may pass through. A single unterminated CLI line above 256 KiB is rejected; the Antigravity fallback text window is capped at 64 KiB with a truncation marker. The host-local debug log is deliberately raw.
 
 ## How it works
 
@@ -274,6 +307,8 @@ make e2e        # opt-in real Linear + harness test
 ```
 
 The live end-to-end test is disabled by default. It requires `CYMPHONY_RUN_LIVE_E2E=1`, a Linear API key, and the configured live-test environment; it creates real Linear data and should not be run casually.
+
+**Verification snapshot (2026-09-25, commit `4e86cd3`):** the sanitized `make all` gate passed with 1,267 tests, 0 failures, 2 skipped, 100% coverage of tracked modules, and Dialyzer 0 errors. Forced strict compilation (`--warnings-as-errors`) and `mix hex.audit` also passed; Hex reported no retired or security-advisory packages. The two skipped tests are live end-to-end checks. A separate ego lite preview check covered the real dashboard, theme/mode controls, and expanded harness panel using fictional fixtures; no live Linear or SSH integration was exercised. See [the hardening audit](docs/audits/2026-09-25-hardening.md) for scope and limitations.
 
 ## License
 
