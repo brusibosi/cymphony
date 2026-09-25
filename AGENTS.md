@@ -354,14 +354,18 @@ CymphonyElixir.Supervisor (one_for_one)
 ├── Registry (ProjectRegistry, :unique)
 ├── Task.Supervisor (for AgentRunner tasks)
 ├── DynamicSupervisor (ProjectDynamicSupervisor)
-│   └── ProjectSupervisor (per project)
-│       ├── WorkflowStore
-│       └── Orchestrator
+│   ├── ProjectSupervisor (per configured project)
+│   │   ├── WorkflowStore
+│   │   └── Orchestrator
+│   └── LegacySupervisor (only in explicit WORKFLOW.md mode)
+│       ├── WorkflowStore (global name)
+│       └── Orchestrator (global name)
 ├── HttpServer (Bandit + Phoenix)
 └── StatusDashboard
 ```
 
 Each project gets its own `ProjectSupervisor` with a `WorkflowStore` and `Orchestrator`, registered via `ProjectRegistry` for lookup by `{project_name, role}`.
+The CLI starts `LegacySupervisor` on demand only for a direct `WORKFLOW.md` path, after `ensure_all_started`; the application and Burrito release can boot without a workflow. Its global store/orchestrator are named and supervised. A repeated legacy start is idempotent, and store/orchestrator startup errors propagate to the CLI (so background startup does not claim a pidfile). Multi-project startup must not start this global runtime.
 
 ## Web Dashboard
 

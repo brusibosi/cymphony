@@ -5,6 +5,7 @@ defmodule CymphonyElixir.CLI do
 
   alias CymphonyElixir.Agent
   alias CymphonyElixir.Daemon
+  alias CymphonyElixir.LegacySupervisor
   alias CymphonyElixir.LogFile
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
@@ -43,6 +44,8 @@ defmodule CymphonyElixir.CLI do
           :set_logs_root => (String.t() -> :ok | {:error, term()}),
           :set_server_port_override => (non_neg_integer() | nil -> :ok | {:error, term()}),
           :ensure_all_started => (-> ensure_started_result()),
+          # Optional for existing callers that inject application startup.
+          optional(:start_legacy_runtime) => (-> :ok | {:error, term()}),
           # Injected by tests so the background-start conformance cases can
           # launch a stand-in binary instead of the real daemon.
           optional(:daemon_executable) => (-> daemon_executable_result())
@@ -655,7 +658,10 @@ defmodule CymphonyElixir.CLI do
 
       case deps.ensure_all_started.() do
         {:ok, _started_apps} ->
-          :ok
+          case Map.get(deps, :start_legacy_runtime, fn -> :ok end).() do
+            :ok -> :ok
+            {:error, reason} -> {:error, "Failed to start Cymphony with workflow #{expanded_path}: #{inspect(reason)}"}
+          end
 
         {:error, reason} ->
           {:error, "Failed to start Cymphony with workflow #{expanded_path}: #{inspect(reason)}"}
@@ -678,7 +684,8 @@ defmodule CymphonyElixir.CLI do
       set_workflow_file_path: &CymphonyElixir.Workflow.set_workflow_file_path/1,
       set_logs_root: &set_logs_root/1,
       set_server_port_override: &set_server_port_override/1,
-      ensure_all_started: fn -> Application.ensure_all_started(:cymphony_elixir) end
+      ensure_all_started: fn -> Application.ensure_all_started(:cymphony_elixir) end,
+      start_legacy_runtime: &LegacySupervisor.start/0
     }
   end
 
