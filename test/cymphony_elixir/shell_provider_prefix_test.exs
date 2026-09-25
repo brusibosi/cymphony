@@ -98,7 +98,7 @@ defmodule CymphonyElixir.ShellProviderPrefixTest do
 
     stub_cmd(fn "zsh", ["-c", script], stderr_to_stdout: true ->
       :counters.add(calls, 1, 1)
-      assert script =~ "type #{name}"
+      assert script =~ "typeset -f #{name}"
       assert script =~ name
 
       output = """
@@ -159,6 +159,48 @@ defmodule CymphonyElixir.ShellProviderPrefixTest do
   test "load_env returns :not_found when the provider function is missing (exit 1)" do
     stub_cmd(fn "zsh", ["-c", _script], _opts -> {"type: not found", 1} end)
     assert ShellProvider.load_env(unique_provider()) == {:error, :not_found}
+  end
+
+  test "load_env never invokes an executable that is not a sourced shell function" do
+    tmp = Path.join(System.tmp_dir!(), "cymphony-shell-provider-#{System.unique_integer([:positive])}")
+    bin = Path.join(tmp, "bin")
+    sentinel = Path.join(tmp, "external-ran")
+    name = unique_provider()
+
+    try do
+      File.mkdir_p!(bin)
+      executable = Path.join(bin, name)
+      File.write!(executable, "#!/bin/sh\nprintf invoked > '#{sentinel}'\n")
+      File.chmod!(executable, 0o755)
+
+      stub_cmd(fn "zsh", args, opts ->
+        System.cmd(
+          "zsh",
+          args,
+          Keyword.merge(opts,
+            env: [
+              {"HOME", tmp},
+              {"ZDOTDIR", tmp},
+              {"PATH", bin <> ":" <> (System.get_env("PATH") || "")}
+            ]
+          )
+        )
+      end)
+
+      assert ShellProvider.load_env(name) == {:error, :not_found}
+      refute File.exists?(sentinel)
+
+      File.write!(
+        Path.join(tmp, ".cld"),
+        "#{name}() { export ANTHROPIC_API_KEY=from-function; }\n"
+      )
+
+      assert {:ok, env} = ShellProvider.load_env(name)
+      assert env["ANTHROPIC_API_KEY"] == "from-function"
+      refute File.exists?(sentinel)
+    after
+      File.rm_rf(tmp)
+    end
   end
 
   test "rejects unsafe provider aliases before invoking any shell" do

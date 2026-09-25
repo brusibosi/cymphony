@@ -2,10 +2,10 @@ defmodule CymphonyElixir.Cymphony.ShellProvider do
   @moduledoc false
 
   @default_env_prefixes ~w(ANTHROPIC_ API_TIMEOUT CLAUDE_CODE_)
-  @safe_function_name ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
-
   @spec valid_name?(term()) :: boolean()
-  def valid_name?(name) when is_binary(name), do: Regex.match?(@safe_function_name, name)
+  def valid_name?(name) when is_binary(name),
+    do: Regex.match?(Regex.compile!("\\A[A-Za-z_][A-Za-z0-9_]*\\z"), name)
+
   def valid_name?(_name), do: false
 
   @spec load_env(String.t(), [String.t()]) :: {:ok, map()} | {:error, :not_found}
@@ -71,7 +71,7 @@ defmodule CymphonyElixir.Cymphony.ShellProvider do
     for f in "$HOME/.cld" "$HOME/.zshrc" "$HOME/.bashrc"; do
       [ -f "$f" ] && source "$f" 2>/dev/null || true
     done
-    type #{provider_name} >/dev/null 2>&1 || exit 1
+    typeset -f #{provider_name} >/dev/null 2>&1 || exit 1
     _unset 2>/dev/null || true
     #{provider_name}
     env
