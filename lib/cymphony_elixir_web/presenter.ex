@@ -93,17 +93,21 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  @spec projects_payload() :: [map()]
+  @spec projects_payload() :: [map()] | {:error, :snapshot_unavailable}
   def projects_payload do
-    {_count, snapshots} = aggregate_project_snapshots(5_000)
+    {count, snapshots} = aggregate_project_snapshots(5_000)
 
-    Enum.map(snapshots, fn %{project_name: project_name, snapshot: snapshot} ->
-      %{
-        name: project_name,
-        running: length(snapshot.running),
-        retrying: length(snapshot.retrying)
-      }
-    end)
+    if count > 0 and snapshots == [] do
+      {:error, :snapshot_unavailable}
+    else
+      Enum.map(snapshots, fn %{project_name: project_name, snapshot: snapshot} ->
+        %{
+          name: project_name,
+          running: length(snapshot.running),
+          retrying: length(snapshot.retrying)
+        }
+      end)
+    end
   end
 
   def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms, project_name \\ nil)
@@ -627,12 +631,12 @@ defmodule CymphonyElixirWeb.Presenter do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if map_size(active) == 0 or remaining <= 0 do
-      Enum.each(active, fn {_ref, {task, _index, _name}} -> Task.shutdown(task, :brutal_kill) end)
+      stop_snapshot_tasks(active)
       results
     else
       receive do
-        {ref, snapshot} when is_map_key(active, ref) ->
-          {_task, index, name} = Map.fetch!(active, ref)
+        {:snapshot_result, worker, snapshot} when is_map_key(active, worker) ->
+          {ref, index, name} = Map.fetch!(active, worker)
           Process.demonitor(ref, [:flush])
 
           results =
@@ -640,13 +644,13 @@ defmodule CymphonyElixirWeb.Presenter do
               do: [{index, %{project_name: name, snapshot: snapshot}} | results],
               else: results
 
-          collect_project_snapshots(queued, Map.delete(active, ref), results, deadline)
+          collect_project_snapshots(queued, Map.delete(active, worker), results, deadline)
 
-        {:DOWN, ref, :process, _pid, _reason} when is_map_key(active, ref) ->
-          collect_project_snapshots(queued, Map.delete(active, ref), results, deadline)
+        {:DOWN, _ref, :process, worker, _reason} when is_map_key(active, worker) ->
+          collect_project_snapshots(queued, Map.delete(active, worker), results, deadline)
       after
         remaining ->
-          Enum.each(active, fn {_ref, {task, _index, _name}} -> Task.shutdown(task, :brutal_kill) end)
+          stop_snapshot_tasks(active)
           results
       end
     end
@@ -656,18 +660,31 @@ defmodule CymphonyElixirWeb.Presenter do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if map_size(active) < 4 and remaining > 0 do
-      task =
-        Task.Supervisor.async_nolink(CymphonyElixir.TaskSupervisor, fn ->
-          Orchestrator.snapshot(pid, remaining)
-        end)
+      owner = self()
 
-      start_snapshot_tasks(rest, Map.put(active, task.ref, {task, index, name}), deadline)
+      try do
+        {worker, ref} =
+          spawn_monitor(fn ->
+            send(owner, {:snapshot_result, self(), Orchestrator.snapshot(pid, remaining)})
+          end)
+
+        start_snapshot_tasks(rest, Map.put(active, worker, {ref, index, name}), deadline)
+      rescue
+        _error -> start_snapshot_tasks(rest, active, deadline)
+      end
     else
       {[{{name, pid}, index} | rest], active}
     end
   end
 
   defp start_snapshot_tasks(queued, active, _deadline), do: {queued, active}
+
+  defp stop_snapshot_tasks(active) do
+    Enum.each(active, fn {worker, {ref, _index, _name}} ->
+      Process.exit(worker, :kill)
+      Process.demonitor(ref, [:flush])
+    end)
+  end
 
   defp merge_project_snapshots(snapshots) do
     all_running =

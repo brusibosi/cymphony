@@ -70,10 +70,10 @@ defmodule CymphonyElixir.DashboardPayloadSingleFlightTest do
 
   test "a burst queues one refresh and an action invalidates the older result", %{server: server} do
     {:ok, view, _} = live(build_conn(), "/")
-    assert_receive {:snapshot_started, 1, _}
+    assert_receive {:snapshot_started, 1, _}, 1_000
 
     due_tick(view)
-    assert_receive {:snapshot_started, 2, _}
+    assert_receive {:snapshot_started, 2, _}, 1_000
 
     for _ <- 1..3 do
       due_tick(view)
@@ -95,10 +95,10 @@ defmodule CymphonyElixir.DashboardPayloadSingleFlightTest do
 
   test "a crashed load releases the slot so the queued refresh can run", %{server: server} do
     {:ok, view, _} = live(build_conn(), "/")
-    assert_receive {:snapshot_started, 1, _}
+    assert_receive {:snapshot_started, 1, _}, 1_000
 
     due_tick(view)
-    assert_receive {:snapshot_started, 2, _}
+    assert_receive {:snapshot_started, 2, _}, 1_000
     due_tick(view)
     assert view_assigns(view).payload_pending? == true
 
@@ -111,10 +111,10 @@ defmodule CymphonyElixir.DashboardPayloadSingleFlightTest do
 
   test "an abruptly terminated LiveView also terminates its in-flight load" do
     {:ok, view, _} = live(build_conn(), "/")
-    assert_receive {:snapshot_started, 1, _}
+    assert_receive {:snapshot_started, 1, _}, 1_000
 
     due_tick(view)
-    assert_receive {:snapshot_started, 2, _}
+    assert_receive {:snapshot_started, 2, _}, 1_000
     worker = view_assigns(view).payload_job.pid
     ref = Process.monitor(worker)
 
@@ -126,10 +126,10 @@ defmodule CymphonyElixir.DashboardPayloadSingleFlightTest do
 
   test "a timed-out load is cancelled and its queued refresh takes the slot", %{server: server} do
     {:ok, view, _} = live(build_conn(), "/")
-    assert_receive {:snapshot_started, 1, _}
+    assert_receive {:snapshot_started, 1, _}, 1_000
 
     due_tick(view)
-    assert_receive {:snapshot_started, 2, _}
+    assert_receive {:snapshot_started, 2, _}, 1_000
     due_tick(view)
     job = view_assigns(view).payload_job
     ref = Process.monitor(job.pid)
@@ -140,6 +140,27 @@ defmodule CymphonyElixir.DashboardPayloadSingleFlightTest do
     assert_receive {:snapshot_started, 3, _}, 500
     send(server, {:release_snapshot, 3})
     assert eventually(fn -> view_assigns(view).payload_job == nil end)
+  end
+
+  test "a failed post-action load cannot admit a stale pre-action payload" do
+    {:ok, view, _} = live(build_conn(), "/")
+    assert_receive {:snapshot_started, 1, _}, 1_000
+    stale_seq = view_assigns(view).payload_seq
+    assert :ok = Supervisor.terminate_child(CymphonyElixir.Supervisor, CymphonyElixir.TaskSupervisor)
+
+    try do
+      send(view.pid, :reload_payload_now)
+      render(view)
+      assert view_assigns(view).payload_generation == 1
+      assert view_assigns(view).payload_job == nil
+
+      counts = view_assigns(view).counts
+      send(view.pid, {:payload_loaded, stale_seq, %{counts: %{counts | running: 99}}})
+      render(view)
+      assert view_assigns(view).counts.running == 0
+    after
+      assert {:ok, _pid} = Supervisor.restart_child(CymphonyElixir.Supervisor, CymphonyElixir.TaskSupervisor)
+    end
   end
 
   defp due_tick(view) do

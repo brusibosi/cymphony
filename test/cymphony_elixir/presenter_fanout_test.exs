@@ -1,7 +1,11 @@
 defmodule CymphonyElixir.PresenterFanoutTest do
   use CymphonyElixir.TestSupport
 
+  import Phoenix.ConnTest
+
   alias CymphonyElixirWeb.Presenter
+
+  @endpoint CymphonyElixirWeb.Endpoint
 
   defmodule SnapshotServer do
     use GenServer
@@ -76,6 +80,35 @@ defmodule CymphonyElixir.PresenterFanoutTest do
     assert payload.error.code == "snapshot_unavailable"
   end
 
+  test "projects API distinguishes failed registered snapshots from an empty fleet" do
+    start_endpoint()
+    start_project("broken", false, :unavailable)
+
+    response = get(build_conn(), "/api/v1/projects")
+
+    assert json_response(response, 503) == %{
+             "error" => %{"code" => "snapshot_unavailable", "message" => "Snapshot unavailable"}
+           }
+  end
+
+  test "projects API returns an empty list for a genuinely empty fleet" do
+    start_endpoint()
+    assert json_response(get(build_conn(), "/api/v1/projects"), 200) == %{"projects" => []}
+  end
+
+  test "observation works while the global task supervisor is unavailable" do
+    start_project("answering", false)
+    assert :ok = Supervisor.terminate_child(CymphonyElixir.Supervisor, CymphonyElixir.TaskSupervisor)
+
+    try do
+      payload = Presenter.state_payload(Module.concat(__MODULE__, :NoLegacy), 500)
+      assert Enum.map(payload.projects, & &1.name) == ["answering"]
+      assert Presenter.projects_payload() == [%{name: "answering", running: 0, retrying: 0}]
+    after
+      assert {:ok, _pid} = Supervisor.restart_child(CymphonyElixir.Supervisor, CymphonyElixir.TaskSupervisor)
+    end
+  end
+
   test "many stalled projects consume one shared deadline, not one timeout each" do
     for index <- 1..8, do: start_project("slow-#{index}", true)
 
@@ -117,5 +150,18 @@ defmodule CymphonyElixir.PresenterFanoutTest do
         }
 
     start_supervised!({SnapshotServer, {name, self(), snapshot, hold?}}, id: name)
+  end
+
+  defp start_endpoint do
+    old = Application.get_env(:cymphony_elixir, CymphonyElixirWeb.Endpoint, [])
+    on_exit(fn -> Application.put_env(:cymphony_elixir, CymphonyElixirWeb.Endpoint, old) end)
+
+    Application.put_env(
+      :cymphony_elixir,
+      CymphonyElixirWeb.Endpoint,
+      Keyword.merge(old, server: false, secret_key_base: String.duplicate("s", 64))
+    )
+
+    start_supervised!({CymphonyElixirWeb.Endpoint, []})
   end
 end

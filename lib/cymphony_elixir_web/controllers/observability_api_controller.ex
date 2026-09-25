@@ -21,7 +21,13 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
 
   @spec projects(Conn.t(), map()) :: Conn.t()
   def projects(conn, _params) do
-    json(conn, %{projects: Presenter.projects_payload()})
+    case Presenter.projects_payload() do
+      {:error, :snapshot_unavailable} ->
+        error_response(conn, 503, "snapshot_unavailable", "Snapshot unavailable")
+
+      projects ->
+        json(conn, %{projects: projects})
+    end
   end
 
   @spec create_project(Conn.t(), map()) :: Conn.t()

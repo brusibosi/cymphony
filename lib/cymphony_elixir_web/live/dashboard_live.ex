@@ -646,15 +646,6 @@ defmodule CymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
-  def handle_info({:payload_loaded, seq, payload}, socket) when is_integer(seq) do
-    if seq != socket.assigns.payload_seq or socket.assigns.payload_job != nil do
-      {:noreply, socket}
-    else
-      {:noreply, apply_payload(socket, payload, false)}
-    end
-  end
-
-  @impl true
   def handle_info({ref, payload}, %{assigns: %{payload_job: %{ref: ref} = job}} = socket)
       when is_reference(ref) do
     Process.demonitor(ref, [:flush])
@@ -686,7 +677,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info({:payload_timeout, ref, generation}, %{assigns: %{payload_job: %{ref: ref, generation: generation} = job}} = socket) do
-    Task.shutdown(job.task, :brutal_kill)
+    if job.task, do: Task.shutdown(job.task, :brutal_kill)
 
     socket =
       socket
@@ -728,7 +719,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
   def terminate(_reason, socket) do
     if job = socket.assigns[:payload_job] do
       Process.cancel_timer(job.timer_ref)
-      Task.shutdown(job.task, :brutal_kill)
+      if job.task, do: Task.shutdown(job.task, :brutal_kill)
     end
 
     :ok
@@ -1643,19 +1634,16 @@ defmodule CymphonyElixirWeb.DashboardLive do
     end
   end
 
-  defp apply_payload(socket, payload, refresh? \\ true) do
+  defp apply_payload(socket, payload) do
     token_samples = update_token_samples(socket.assigns.token_samples, payload)
 
     socket
     |> assign_payload_sections(payload)
     |> assign_token_throughput(token_samples)
     |> assign(:payload_dirty, false)
-    |> maybe_stamp_payload_refresh(refresh?)
+    |> assign(:last_payload_refresh, System.monotonic_time(:millisecond))
     |> update(:agent_setting_drafts, &prune_agent_drafts(&1, payload))
   end
-
-  defp maybe_stamp_payload_refresh(socket, true), do: assign(socket, :last_payload_refresh, System.monotonic_time(:millisecond))
-  defp maybe_stamp_payload_refresh(socket, false), do: socket
 
   defp next_payload_seq(socket), do: (socket.assigns[:payload_seq] || 0) + 1
 
