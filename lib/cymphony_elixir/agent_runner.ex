@@ -6,7 +6,7 @@ defmodule CymphonyElixir.AgentRunner do
 
   require Logger
   alias CymphonyElixir.Agent.Runner
-  alias CymphonyElixir.{Config, HarnessStream, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias CymphonyElixir.{Config, HarnessStream, Linear.Issue, PromptBuilder, PublicEvent, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -34,10 +34,11 @@ defmodule CymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+        # Sanitize structured leaves before inspection can encode invalid bytes.
         # Reason first: this message becomes the retry-queue error text, which
         # the dashboard truncates, and the issue context is already in the log
         # line above.
-        raise RuntimeError, "Agent run failed: #{inspect(reason)} (#{issue_context(issue)})"
+        raise RuntimeError, "Agent run failed: #{PublicEvent.format_diagnostic(reason)} (#{issue_context(issue)})"
     end
   end
 

@@ -3,6 +3,104 @@ defmodule CymphonyElixir.PublicEventTest do
 
   alias CymphonyElixir.PublicEvent
 
+  defmodule EncodedError do
+    defexception [:diagnostic]
+    @impl true
+    def message(exception), do: inspect(exception.diagnostic)
+  end
+
+  test "diagnostic formatting redacts structured leaves before inspection and preserves useful tags" do
+    diagnostic =
+      {:workspace_hook_failed, "before_run", 7, %{"apiKey" => "opaque-secret", details: ["OPENAI_API_KEY=fake-secret" <> <<255>>], path: "/safe/path"}}
+
+    public = PublicEvent.format_diagnostic(diagnostic)
+    assert public =~ ":workspace_hook_failed"
+    assert public =~ "before_run"
+    assert public =~ ", 7,"
+    assert public =~ "/safe/path"
+    assert public =~ "[REDACTED]"
+    refute public =~ "fake-secret"
+    refute public =~ "opaque-secret"
+    refute public =~ "<<"
+    assert String.valid?(public)
+  end
+
+  test "diagnostic keyword entries and named pairs use the same secret-key rule as maps" do
+    fields = [
+      apiKey: "opaque-secret",
+      SSH_KEY_PATH: "/safe/key",
+      CLIENT_SECRET_ID: "visible-id",
+      TOKEN_NAME: "visible-name"
+    ]
+
+    public = PublicEvent.format_diagnostic({:failed, fields, {"Authorization", "opaque-header"}})
+
+    assert public =~ "apiKey:"
+    assert public =~ "Authorization"
+    assert public =~ "/safe/key"
+    assert public =~ "visible-id"
+    assert public =~ "visible-name"
+    assert PublicEvent.format_diagnostic({:error, :timeout}) == "{:error, :timeout}"
+    assert public =~ "[REDACTED]"
+    refute public =~ "opaque-secret"
+    refute public =~ "opaque-header"
+  end
+
+  test "diagnostics never invoke exception callbacks or custom struct inspection on raw leaves" do
+    bytes = "OPENAI_API_KEY=fake-secret" <> <<255>>
+    exception = %EncodedError{diagnostic: {:failed, bytes}}
+    public = PublicEvent.format_diagnostic({exception, []})
+    assert public =~ "diagnostic"
+    assert public =~ "[REDACTED]"
+    refute public =~ "<<"
+    refute public =~ "fake-secret"
+
+    struct_text = PublicEvent.format_diagnostic(%Range{first: bytes, last: 7, step: 1})
+    assert struct_text =~ "first:"
+    assert struct_text =~ "[REDACTED]"
+    refute struct_text =~ "<<"
+
+    assert PublicEvent.format_diagnostic({RuntimeError.exception(bytes), []}) == "OPENAI_API_KEY=[REDACTED]"
+    assert PublicEvent.format_diagnostic({RuntimeError.exception("safe error"), []}) == "safe error"
+  end
+
+  test "diagnostics sanitize atom tags and omit encoded or unsupported scalar representations" do
+    assert PublicEvent.format_diagnostic(:timeout) == ":timeout"
+    assert PublicEvent.format_diagnostic(:"OPENAI_API_KEY=fake-secret") =~ "[REDACTED]"
+
+    for value <- [~c"OPENAI_API_KEY=fake-secret", <<255::size(7)>>, self(), make_ref(), fn -> :ok end, ["OPENAI_API_KEY=fake-secret" | "unsafe-tail"]] do
+      public = PublicEvent.format_diagnostic(value)
+      assert public =~ "[event text omitted]"
+      refute public =~ "fake-secret"
+      refute public =~ "<<"
+      refute public =~ "79, 80, 69"
+    end
+  end
+
+  test "diagnostics bound oversize leaves, tuple breadth, aggregate size and depth before formatting" do
+    assert PublicEvent.format_diagnostic({}) == "{}"
+
+    assert PublicEvent.format_diagnostic({:failed, "safe", [true, false, nil], %{status: 7}}) ==
+             "{:failed, \"safe\", [true, false, nil], %{status: 7}}"
+
+    assert PublicEvent.format_diagnostic({:failed, String.duplicate("x", 8193)}) =~ "[event text omitted]"
+
+    wide = List.to_tuple(List.duplicate(:safe, 20) ++ ["outside-child-budget"])
+    deep = Enum.reduce(1..100, "outside-depth-budget", fn _, acc -> {:nested, acc} end)
+    nodes = List.to_tuple(List.duplicate(List.to_tuple(List.duplicate(:safe, 20)), 20))
+    bytes = List.to_tuple(List.duplicate(String.duplicate("x", 1024), 20))
+
+    for value <- [wide, deep, nodes, bytes] do
+      public = PublicEvent.format_diagnostic(value)
+      assert String.valid?(public)
+      assert byte_size(public) <= 1024
+      refute public =~ "outside-"
+    end
+
+    assert PublicEvent.format_diagnostic(nodes) =~ "nil"
+    assert PublicEvent.format_diagnostic({:failed, ["safe", "ok"]}) =~ "safe"
+  end
+
   test "redacts real Claude, Codex and Antigravity event payloads without losing event shape" do
     claude = %{
       "type" => "assistant",

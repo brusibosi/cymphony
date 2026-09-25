@@ -97,11 +97,11 @@ defmodule CymphonyElixir.FinalReviewRegressionTest do
     for n <- 1..16, do: assert(pins["API-#{n}"] == %{"model" => "model-api", "effort" => "high", "agent_kind" => "codex"})
   end
 
-  for diagnostic <- [:credential, :oversized_invalid] do
+  for diagnostic <- [:credential, :short_invalid, :oversized_invalid] do
     test "#{diagnostic} hook errors stay bounded and redacted in retries, API payload and abandonment", ctx do
       issue = issue("hook")
       diagnostic = unquote(diagnostic)
-      secret = "fixture-credential-not-for-publication"
+      secret = "fake-secret"
       output = Path.join(ctx.root, "hook-output")
 
       bytes = hook_diagnostic(diagnostic, secret)
@@ -110,9 +110,14 @@ defmodule CymphonyElixir.FinalReviewRegressionTest do
       Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue])
       Application.put_env(:cymphony_elixir, :memory_tracker_recipient, self())
 
-      pid = legacy(ctx, hook_before_run: "cat '#{output}'; exit 7", max_retry_attempts: 1)
-      retry = eventually(fn -> List.first(Orchestrator.snapshot(pid, 100).retrying) end)
-      payload = Presenter.state_payload(pid, 1_000)
+      {{pid, retry}, raw_log} =
+        with_log(fn ->
+          pid = legacy(ctx, hook_before_run: "cat '#{output}'; exit 7", max_retry_attempts: 1)
+          retry = eventually(fn -> List.first(Orchestrator.snapshot(pid, 100).retrying) end)
+          {pid, retry}
+        end)
+
+      api = api_state(pid)
 
       eventually(fn -> map_size(:sys.get_state(pid).work.retiring) == 0 end)
       entry = :sys.get_state(pid).retry_attempts[issue.id]
@@ -120,15 +125,105 @@ defmodule CymphonyElixir.FinalReviewRegressionTest do
       assert_receive {:memory_tracker_comment, id, body}, 5_000
       assert String.valid?(retry.error)
       assert byte_size(retry.error) <= 1_024
-      refute retry.error =~ secret
-      refute Jason.encode!(payload) =~ secret
-      assert Jason.encode!(payload) =~ "retrying"
+      assert_public_diagnostic(retry.error, secret)
+      assert_public_diagnostic(api, secret)
+      assert api =~ "retrying"
+      assert raw_log =~ inspect({:workspace_hook_failed, "before_run", 7, bytes})
       assert id == issue.id
       assert body =~ "abandoned"
       assert String.valid?(body)
       assert byte_size(body) < 1_500
-      refute body =~ secret
+      assert_public_diagnostic(body, secret)
     end
+  end
+
+  for task_reason <- [:raw, :exception] do
+    test "#{task_reason} structured task exits redact binary leaves before retry, API and abandonment formatting", ctx do
+      issue = issue("raw-task-error")
+      secret = "fake-secret"
+      bytes = "OPENAI_API_KEY=" <> secret <> <<255>>
+      raw_reason = {:diagnostic_failed, 7, %{"apiKey" => "opaque-secret", details: [bytes]}}
+      reason = if unquote(task_reason) == :raw, do: raw_reason, else: {ErlangError.exception(original: raw_reason), []}
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue])
+      Application.put_env(:cymphony_elixir, :memory_tracker_recipient, self())
+      pid = legacy(ctx, max_retry_attempts: 1)
+      :ok = Orchestrator.run_poll_cycle_for_test(pid)
+      worker = :sys.get_state(pid).running[issue.id].pid
+
+      raw_log =
+        capture_log(fn ->
+          Process.exit(worker, reason)
+          eventually(fn -> :sys.get_state(pid).retry_attempts[issue.id] end)
+        end)
+
+      retry = hd(Orchestrator.snapshot(pid, 100).retrying)
+      api = api_state(pid)
+      eventually(fn -> map_size(:sys.get_state(pid).work.retiring) == 0 end)
+      entry = :sys.get_state(pid).retry_attempts[issue.id]
+      send(pid, {:retry_issue, issue.id, entry.retry_token})
+      eventually(fn -> :sys.get_state(pid).running[issue.id] end)
+      Process.exit(:sys.get_state(pid).running[issue.id].pid, reason)
+      assert_receive {:memory_tracker_comment, id, body}, 5_000
+      assert id == issue.id
+      assert body =~ "abandoned"
+
+      for public <- [retry.error, api, body] do
+        assert_public_diagnostic(public, secret)
+        refute public =~ "opaque-secret"
+        assert public =~ "diagnostic_failed"
+      end
+
+      assert raw_log =~ inspect(reason)
+    end
+  end
+
+  test "ancillary cleanup failures sanitize structured reasons before public retention" do
+    secret = "fake-secret"
+    error = {:error, {:port_cleanup_failed, "OPENAI_API_KEY=" <> secret <> <<255>>}}
+
+    for kind <- [:effect, :reap] do
+      original_ref = make_ref()
+      ref = make_ref()
+      timer = Process.send_after(self(), :unused, 60_000)
+      original = %{key: {:poll, :config}, timer: timer}
+      key = if kind == :reap, do: {:reap, original_ref}, else: {:effect, {:stop, "cleanup"}}
+      job = %{key: key, timer: timer, context: %{work: fn -> :ok end}}
+      state = %Orchestrator.State{paused: true, poll_check_in_progress: false}
+      state = %{state | work: %{state.work | io_jobs: %{ref => job, original_ref => original}}}
+
+      {{:noreply, result}, raw_log} = with_log(fn -> Orchestrator.handle_info({ref, error}, state) end)
+      assert_public_diagnostic(result.work.cleanup_error, secret)
+      assert raw_log =~ inspect(error)
+      Process.cancel_timer(result.work.io_jobs[original_ref].timer)
+    end
+  end
+
+  test "dispatch-refresh failures sanitize structured reasons before scheduling a retry" do
+    issue = issue("refresh-error")
+    secret = "fake-secret"
+    reason = {:refresh_failed, "OPENAI_API_KEY=" <> secret <> <<255>>}
+    ref = make_ref()
+    token = make_ref()
+    config = Config.settings!()
+    timer = Process.send_after(self(), :unused, 60_000)
+    context = %{source: :retry, retry_token: token, manual: true, config: config, prompt: "prompt", issue: issue, attempt: 1}
+    job = %{key: {:intent, issue.id}, timer: timer, context: context}
+
+    state = %Orchestrator.State{
+      config: config,
+      prompt_template: "prompt",
+      paused: true,
+      poll_check_in_progress: false,
+      retry_attempts: %{issue.id => %{attempt: 1, retry_token: token}}
+    }
+
+    state = %{state | work: %{state.work | io_jobs: %{ref => job}, intent_jobs: %{issue.id => ref}}}
+
+    {:noreply, result} = Orchestrator.handle_info({ref, {:error, reason}}, state)
+    retry = result.retry_attempts[issue.id]
+    assert retry.error =~ "dispatch refresh failed"
+    assert_public_diagnostic(retry.error, secret)
+    Process.cancel_timer(retry.timer_ref)
   end
 
   test "non-hook task exceptions are redacted and scrubbed before retry retention", ctx do
@@ -262,6 +357,30 @@ defmodule CymphonyElixir.FinalReviewRegressionTest do
     refute prompt =~ "OTHER PROJECT PROMPT"
   end
 
+  # Detect the original lossless decimal-binary encoding, not just a literal leak.
+  defp assert_public_diagnostic(public, secret) do
+    assert String.valid?(public)
+    refute public =~ secret
+
+    for [_, vector] <- Regex.scan(Regex.compile!("<<([0-9, ]+)>>"), public) do
+      decoded = vector |> String.split(",") |> Enum.map(&(String.trim(&1) |> String.to_integer())) |> :binary.list_to_bin()
+      refute decoded =~ secret
+    end
+
+    assert public =~ "[REDACTED]" or public =~ "[event text omitted]"
+  end
+
+  defp api_state(pid) do
+    endpoint_config = Application.get_env(:cymphony_elixir, @endpoint, [])
+    Application.put_env(:cymphony_elixir, @endpoint, Keyword.merge(endpoint_config, server: false, orchestrator: pid, secret_key_base: String.duplicate("s", 64)))
+    on_exit(fn -> Application.put_env(:cymphony_elixir, @endpoint, endpoint_config) end)
+    start_supervised!({@endpoint, []})
+    conn = get(build_conn(), "/api/v1/state")
+    assert conn.status == 200
+    conn.resp_body
+  end
+
+  defp hook_diagnostic(:short_invalid, secret), do: "OPENAI_API_KEY=#{secret}" <> <<255>>
   defp hook_diagnostic(:credential, secret), do: "OPENAI_API_KEY=#{secret}\n"
   defp hook_diagnostic(:oversized_invalid, secret), do: "OPENAI_API_KEY=#{secret}\n" <> String.duplicate("large diagnostic ", 10_000) <> <<255>>
 

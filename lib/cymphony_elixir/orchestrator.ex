@@ -256,7 +256,7 @@ defmodule CymphonyElixir.Orchestrator do
 
               maybe_retry_or_abandon(state, issue_id, next_attempt, failures, %{
                 identifier: running_entry.identifier,
-                error: "agent exited: #{format_exit_reason(reason)}",
+                error: "agent exited: #{PublicEvent.format_diagnostic(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path),
                 failures: failures
@@ -522,7 +522,7 @@ defmodule CymphonyElixir.Orchestrator do
     Logger.error("Owned process cleanup failed; dispatch remains suppressed: #{inspect(error)}")
     timer = Process.send_after(self(), {:io_timeout, ref}, 1_000)
     jobs = Map.update!(state.work.io_jobs, ref, &%{&1 | timer: timer})
-    put_work(state, io_jobs: jobs, cleanup_error: PublicEvent.sanitize(inspect(error)))
+    put_work(state, io_jobs: jobs, cleanup_error: PublicEvent.format_diagnostic(error))
   end
 
   defp apply_io_result(state, %{key: {:effect, {:stop, id}}}, :ok) do
@@ -550,7 +550,7 @@ defmodule CymphonyElixir.Orchestrator do
     put_work(state,
       effect_queue: Map.put(state.work.effect_queue, key, work),
       effect_blocked: MapSet.put(state.work.effect_blocked, key),
-      cleanup_error: PublicEvent.sanitize(inspect(error))
+      cleanup_error: PublicEvent.format_diagnostic(error)
     )
   end
 
@@ -1287,7 +1287,7 @@ defmodule CymphonyElixir.Orchestrator do
        when is_integer(attempt) do
     schedule_issue_retry(state, issue.id, attempt + 1, %{
       identifier: issue.identifier,
-      error: "dispatch refresh failed: #{inspect(reason)}"
+      error: "dispatch refresh failed: #{PublicEvent.format_diagnostic(reason)}"
     })
   end
 
@@ -1478,7 +1478,7 @@ defmodule CymphonyElixir.Orchestrator do
 
     maybe_retry_or_abandon(state, issue.id, next_attempt, failures, %{
       identifier: issue.identifier,
-      error: "failed to spawn agent: #{inspect(reason)}",
+      error: "failed to spawn agent: #{PublicEvent.format_diagnostic(reason)}",
       worker_host: worker_host,
       failures: failures
     })
@@ -1923,16 +1923,6 @@ defmodule CymphonyElixir.Orchestrator do
   # agent failures (crash, spawn failure, stall) increment `failures`;
   # backpressure ("no slots") and transient poll failures preserve it, so a
   # healthy-but-slot-starved issue is never abandoned.
-  # A crashed agent task exits with {exception, stacktrace}. The exception
-  # message already carries the agent CLI's own failure text; inspecting the
-  # whole tuple buries it behind the struct and the stacktrace, past the
-  # truncation the dashboard retry row applies.
-  defp format_exit_reason({%{__exception__: true} = exception, stacktrace}) when is_list(stacktrace) do
-    Exception.message(exception)
-  end
-
-  defp format_exit_reason(reason), do: inspect(reason)
-
   defp maybe_retry_or_abandon(%State{} = state, issue_id, attempt, failures, metadata)
        when is_integer(failures) do
     if failures > max_retry_attempts(state) do
