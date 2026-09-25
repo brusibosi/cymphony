@@ -171,6 +171,8 @@ defmodule CymphonyElixir.Orchestrator.WorkflowHotReloadTest do
     }
 
     :sys.replace_state(orchestrator, fn state ->
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue])
+
       entry = %{
         identifier: issue.identifier,
         issue: issue,
@@ -214,5 +216,7 @@ defmodule CymphonyElixir.Orchestrator.WorkflowHotReloadTest do
   defp rewrite!(ctx, store, overrides) do
     write_workflow_file!(ctx.workflow_path, Keyword.merge([tracker_kind: "memory"], overrides))
     assert :ok = WorkflowStore.force_reload(store)
+    orchestrator = ProjectSupervisor.lookup(ctx.project_name, :orchestrator)
+    assert :ok = Orchestrator.run_poll_cycle_for_test(orchestrator)
   end
 end

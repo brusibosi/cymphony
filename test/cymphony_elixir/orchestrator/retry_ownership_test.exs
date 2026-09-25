@@ -9,7 +9,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = retry_state(issue, endpoint)
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert result.running == %{}
     refute Map.has_key?(result.retry_attempts, issue.id)
@@ -24,7 +24,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = retry_state(issue, endpoint)
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert result.running == %{}
     refute Map.has_key?(result.retry_attempts, issue.id)
@@ -37,7 +37,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = retry_state(issue, endpoint)
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert result.running == %{}
     refute Map.has_key?(result.retry_attempts, issue.id)
@@ -51,7 +51,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = %{state | config: %{state.config | agent: %{state.config.agent | max_retry_attempts: 3}}}
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert result.running == %{}
 
@@ -68,7 +68,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = retry_state(issue, endpoint)
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert %{attempt: 3, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
     assert is_reference(timer_ref)
@@ -81,7 +81,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = %{retry_state(issue, endpoint) | max_concurrent_agents: 0}
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert %{attempt: 3, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
     assert is_reference(timer_ref)
@@ -99,7 +99,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = %{state | config: config, max_concurrent_agents: 2, running: %{"occupied" => occupied}}
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert %{attempt: 3, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
     assert is_reference(timer_ref)
@@ -113,7 +113,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = retry_state(issue, endpoint)
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert %{retry_attempt: 2, failure_count: 3, pid: pid} = result.running[issue.id]
     assert is_pid(pid)
@@ -127,7 +127,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     endpoint = linear_endpoint(issue, by_id: issue)
     state = retry_state(issue, endpoint)
 
-    assert {:noreply, ^state} = Orchestrator.handle_info({:retry_issue, issue.id, make_ref()}, state)
+    assert {:noreply, ^state} = apply_info({:retry_issue, issue.id, make_ref()}, state)
     refute_receive {:linear_query, _}
   end
 
@@ -137,7 +137,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = %{retry_state(issue, endpoint) | paused: true}
     token = state.retry_attempts[issue.id].retry_token
 
-    {:noreply, result} = Orchestrator.handle_info({:retry_issue, issue.id, token}, state)
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
     assert %{attempt: 2, failures: 3, held: true, timer_ref: nil} = result.retry_attempts[issue.id]
     assert MapSet.member?(result.claimed, issue.id)
@@ -150,12 +150,38 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     state = %{retry_state(issue, endpoint) | paused: true}
 
     {:reply, :ok, result} =
-      Orchestrator.handle_call({:retry_issue_now, issue.id}, {self(), make_ref()}, state)
+      apply_call({:retry_issue_now, issue.id}, state)
 
     assert %{retry_attempt: 2, failure_count: 3, pid: pid} = result.running[issue.id]
     assert is_pid(pid)
     refute Map.has_key?(result.retry_attempts, issue.id)
     Process.exit(pid, :kill)
+  end
+
+  defp apply_info(message, state) do
+    {:noreply, state} = Orchestrator.handle_info(message, state)
+    {:noreply, await_io(state)}
+  end
+
+  defp apply_call(message, state) do
+    {:reply, reply, state} = Orchestrator.handle_call(message, {self(), make_ref()}, state)
+    {:reply, reply, await_io(state)}
+  end
+
+  defp await_io(%{work: %{io_jobs: jobs}} = state) when map_size(jobs) == 0, do: state
+
+  defp await_io(state) do
+    receive do
+      {ref, _result} = message when is_map_key(state.work.io_jobs, ref) ->
+        {:noreply, state} = Orchestrator.handle_info(message, state)
+        await_io(state)
+
+      {:DOWN, ref, :process, _pid, _reason} = message when is_map_key(state.work.io_jobs, ref) ->
+        {:noreply, state} = Orchestrator.handle_info(message, state)
+        await_io(state)
+    after
+      2_000 -> flunk("asynchronous retry did not finish")
+    end
   end
 
   defp issue(id, identifier, state) do
@@ -207,7 +233,11 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     plug = fn conn, _plug_opts ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       query = Jason.decode!(body)["query"]
-      send(parent, {:linear_query, if(String.contains?(query, "CymphonyLinearIssuesById"), do: :by_id, else: :poll)})
+
+      send(
+        parent,
+        {:linear_query, if(String.contains?(query, "CymphonyLinearIssuesById"), do: :by_id, else: :poll)}
+      )
 
       response =
         if String.contains?(query, "CymphonyLinearIssuesById") do

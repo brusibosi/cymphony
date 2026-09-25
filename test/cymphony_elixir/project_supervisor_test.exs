@@ -44,12 +44,12 @@ defmodule CymphonyElixir.ProjectSupervisorTest do
     assert ProjectSupervisor.list_orchestrators(missing) == []
   end
 
-  test "init/1 builds a one_for_one supervisor with store and orchestrator children" do
+  test "init/1 builds a one_for_all runtime with store, task supervisor and orchestrator" do
     assert {:ok, {flags, children}} =
              ProjectSupervisor.init(project_name: "Farm", workflow_path: "/tmp/WORKFLOW.md")
 
-    assert flags.strategy == :one_for_one
-    assert length(children) == 2
+    assert flags.strategy == :one_for_all
+    assert length(children) == 4
   end
 
   test "start_link/1 fails when the workflow file is missing" do

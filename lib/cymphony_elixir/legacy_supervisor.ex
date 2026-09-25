@@ -45,6 +45,18 @@ defmodule CymphonyElixir.LegacySupervisor do
 
   @impl true
   def init(_opts) do
-    Supervisor.init([WorkflowStore, Orchestrator], strategy: :one_for_one)
+    orchestrator_opts = [
+      task_supervisor: CymphonyElixir.LegacyTaskSupervisor,
+      port_supervisor: CymphonyElixir.LegacyPortSupervisor
+    ]
+
+    children = [
+      WorkflowStore,
+      {DynamicSupervisor, name: CymphonyElixir.LegacyPortSupervisor, strategy: :one_for_one},
+      {Task.Supervisor, name: CymphonyElixir.LegacyTaskSupervisor},
+      {Orchestrator, orchestrator_opts}
+    ]
+
+    Supervisor.init(children, strategy: :one_for_all)
   end
 end

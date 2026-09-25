@@ -352,13 +352,17 @@ CymphonyElixir.Supervisor (one_for_one)
 ├── Phoenix.PubSub
 ├── HarnessStream (ETS ring of live CLI stdout; after PubSub, before HttpServer)
 ├── Registry (ProjectRegistry, :unique)
-├── Task.Supervisor (for AgentRunner tasks)
+├── Task.Supervisor (application-wide auxiliary callers; not runtime agents)
 ├── DynamicSupervisor (ProjectDynamicSupervisor)
 │   ├── ProjectSupervisor (per configured project)
 │   │   ├── WorkflowStore
+│   │   ├── PortSupervisor (DynamicSupervisor of Agent.PortGuard children)
+│   │   ├── Task.Supervisor (agents and bounded I/O jobs)
 │   │   └── Orchestrator
 │   └── LegacySupervisor (only in explicit WORKFLOW.md mode)
 │       ├── WorkflowStore (global name)
+│       ├── LegacyPortSupervisor
+│       ├── LegacyTaskSupervisor
 │       └── Orchestrator (global name)
 ├── HttpServer (Bandit + Phoenix)
 └── StatusDashboard
@@ -366,6 +370,44 @@ CymphonyElixir.Supervisor (one_for_one)
 
 Each project gets its own `ProjectSupervisor` with a `WorkflowStore` and `Orchestrator`, registered via `ProjectRegistry` for lookup by `{project_name, role}`.
 The CLI starts `LegacySupervisor` on demand only for a direct `WORKFLOW.md` path, after `ensure_all_started`; the application and Burrito release can boot without a workflow. Its global store/orchestrator are named and supervised. A repeated legacy start with the same path is idempotent; a different path is rejected before changing the global workflow setting (stop the current runtime first). Store/orchestrator startup errors propagate to the CLI (so background startup does not claim a pidfile). Multi-project startup must not start this global runtime.
+
+### Runtime-owned work and responsive controls
+
+Project and legacy runtimes use `:one_for_all` with the store, port supervisor,
+task supervisor, then orchestrator in startup order. Restart/removal shuts down
+agents and joins port cleanup before starting a replacement. Keeping port guards
+under a **separate** sibling supervisor also preserves that barrier when the task
+supervisor itself crashes. Project registry cleanup includes both new roles.
+Direct `CymphonyElixir.start_link/1` starts owner-linked unnamed supervisors; it
+never silently places its agents beneath the application-wide task supervisor.
+
+`Agent.PortGuard` owns each CLI/hook/local SSH port, monitors its worker, and
+kills only its captured OS process group (or captured root PID when group
+leadership is unavailable). Task-created shell scripts wait for a silent stdin
+readiness marker until the guard captures the group, then close stdin before the
+actual command. This prevents a fast-exiting wrapper from escaping capture.
+Explicit per-issue restarts and timed-out cleanup jobs asynchronously reap the
+old guard before dispatch suppression is lifted. Failed reaping is logged,
+exposed as `polling.cleanup_error`, and retried without launching into the old
+workspace. Intentionally detached/new-session descendants, whole-BEAM/host
+failure, and remote-process cleanup across SSH are outside this local lifetime
+guarantee (only the local SSH client group is owned); this is not remote
+exactly-once execution.
+
+Tracker/config refresh work is supervised and bounded: one coalesced poll (plus one
+pending refresh), at most four per-issue validation intents, and at most four
+active ancillary effects sharing the I/O budget. Intent slots refill within the
+same poll; a per-poll attempted-ID set prevents transient failures from producing
+a tight revalidation loop. Deadlines and monitor failures
+release work or enter the explicit reaping phase. Config and prompt arrive as
+typed data; results never merge a copied `%State{}` back into the owner. Results
+recheck current configuration, pause, capacity, pins, claims and retry tokens;
+running-state refreshes additionally match captured monitor references. Agent
+messages carry per-run tokens, and tokenless messages are rejected for tokened
+production runs. Startup/terminal cleanup, abandonment and retention sweeps run
+outside the owner and suppress overlapping dispatch. The watchdog runs during
+slow polls. Snapshots read cached state only; file/config refresh occurs at poll
+boundaries, not during a snapshot call.
 
 ## Web Dashboard
 

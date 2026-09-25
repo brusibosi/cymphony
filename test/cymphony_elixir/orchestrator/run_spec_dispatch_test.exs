@@ -4,6 +4,17 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Orchestrator
 
+  setup do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: Path.join(Path.dirname(Workflow.workflow_file_path()), "workspaces"),
+      hook_before_run: "sleep 60",
+      poll_interval_ms: 60_000
+    )
+
+    :ok
+  end
+
   test "dispatch resolves per-issue run spec from labels and directive" do
     issue = %Issue{
       id: "iss-runspec-1",
@@ -59,6 +70,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "orchestrator running entry carries agent_kind/model/effort after dispatch" do
     orchestrator_name = Module.concat(__MODULE__, :RunSpecOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
 
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
@@ -74,7 +86,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
 
     :ok = Orchestrator.dispatch_issue_for_test(pid, issue)
 
-    snapshot = GenServer.call(pid, :snapshot)
+    snapshot = running_snapshot(pid)
     assert %{running: [entry]} = snapshot
     assert entry.effort == "high"
     assert entry.agent_kind == "claude"
@@ -84,6 +96,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "orchestrator running entry stores agent:antigravity from labels" do
     orchestrator_name = Module.concat(__MODULE__, :AntigravityLabelOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
 
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
@@ -99,7 +112,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
 
     :ok = Orchestrator.dispatch_issue_for_test(pid, issue)
 
-    snapshot = GenServer.call(pid, :snapshot)
+    snapshot = running_snapshot(pid)
     assert %{running: [entry]} = snapshot
     assert entry.agent_kind == "antigravity"
     assert entry.effort == "medium"
@@ -108,6 +121,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "set_issue_run_spec kills and re-dispatches with pinned overrides" do
     orchestrator_name = Module.concat(__MODULE__, :OverrideOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     issue = %Issue{
@@ -128,7 +142,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
                effort: "max"
              })
 
-    snapshot = GenServer.call(pid, :snapshot)
+    snapshot = running_snapshot(pid)
     assert %{running: [entry]} = snapshot
     assert entry.provider == "cz2"
     assert entry.model == "opus"
@@ -141,6 +155,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "set_issue_run_spec restarts the session with a pinned agent_kind" do
     orchestrator_name = Module.concat(__MODULE__, :KindOverrideOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     issue = %Issue{
@@ -163,7 +178,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
                effort: "high"
              })
 
-    snapshot = GenServer.call(pid, :snapshot)
+    snapshot = running_snapshot(pid)
     assert %{running: [entry]} = snapshot
     assert entry.agent_kind == "antigravity"
     assert entry.model == "gemini-3.7-flash-high"
@@ -173,6 +188,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "set_providers writes the rotation onto the active kind section" do
     orchestrator_name = Module.concat(__MODULE__, :ProvidersSectionOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     assert :ok = Orchestrator.set_providers(pid, ["cv1", "cz2"])
@@ -195,6 +211,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "set_agent_settings accepts known kinds and ignores unknown ones" do
     orchestrator_name = Module.concat(__MODULE__, :KindSettingOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     assert :ok = Orchestrator.set_agent_settings(pid, %{"agent" => "antigravity"})
@@ -208,10 +225,11 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   end
 
   test "snapshot agent_command comes from the active kind section" do
-    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "antigravity")
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", agent_kind: "antigravity")
 
     orchestrator_name = Module.concat(__MODULE__, :AgentCommandOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     snapshot = GenServer.call(pid, :snapshot)
@@ -220,11 +238,12 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   end
 
   test "snapshot.agent_kind follows config.json when runtime_agent is unset" do
-    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "claude")
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", agent_kind: "claude")
     project_name = put_config_json_project!(%{"agent" => "codex"})
 
     orchestrator_name = Module.concat(__MODULE__, :ConfigJsonAgentOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, project_name: project_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     snapshot = GenServer.call(pid, :snapshot)
@@ -233,11 +252,12 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   end
 
   test "set_agent_settings still wins snapshot while runtime_agent is set" do
-    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "claude")
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", agent_kind: "claude")
     project_name = put_config_json_project!(%{"agent" => "codex"})
 
     orchestrator_name = Module.concat(__MODULE__, :RuntimeAgentWinsOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, project_name: project_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     assert :ok = Orchestrator.set_agent_settings(pid, %{"agent" => "antigravity"})
@@ -250,13 +270,15 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "snapshot overlays tracker.api_key from config.json linear_api_key" do
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_kind: "claude",
-      tracker_api_token: "token"
+      tracker_api_token: "token",
+      tracker_kind: "memory"
     )
 
     project_name = put_config_json_project!(%{"linear_api_key" => "lin_test"})
 
     orchestrator_name = Module.concat(__MODULE__, :ConfigJsonKeyOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, project_name: project_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     _snapshot = GenServer.call(pid, :snapshot)
@@ -267,6 +289,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
     isolate_config_dir()
     orchestrator_name = Module.concat(__MODULE__, :WaitingPinBeatsLabels)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     issue = %Issue{
@@ -288,7 +311,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
 
     :ok = Orchestrator.dispatch_issue_for_test(pid, issue)
 
-    snapshot = GenServer.call(pid, :snapshot)
+    snapshot = running_snapshot(pid)
     assert %{running: [entry]} = snapshot
     assert entry.agent_kind == "codex"
     assert entry.model == "gpt-5.2-codex"
@@ -299,6 +322,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
     isolate_config_dir()
     orchestrator_name = Module.concat(__MODULE__, :EmptyPinFallsThrough)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     issue = %Issue{
@@ -320,7 +344,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
 
     :ok = Orchestrator.dispatch_issue_for_test(pid, issue)
 
-    snapshot = GenServer.call(pid, :snapshot)
+    snapshot = running_snapshot(pid)
     assert %{running: [entry]} = snapshot
     assert entry.agent_kind == "codex"
     assert entry.model == "gpt-5.2-codex"
@@ -330,6 +354,7 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
   test "a retry dispatch re-resolves labels (label edits take effect on next attempt)" do
     orchestrator_name = Module.concat(__MODULE__, :RetryResolveOrch)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = Orchestrator.run_poll_cycle_for_test(pid)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
     base = %Issue{
@@ -350,6 +375,20 @@ defmodule CymphonyElixir.Orchestrator.RunSpecDispatchTest do
     :ok = Orchestrator.dispatch_issue_for_test(pid, %{base | labels: ["effort:max"]})
     assert %{running: [second]} = GenServer.call(pid, :snapshot)
     assert second.effort == "max"
+  end
+
+  defp running_snapshot(pid, attempts \\ 100)
+  defp running_snapshot(pid, 0), do: GenServer.call(pid, :snapshot)
+
+  defp running_snapshot(pid, attempts) do
+    case GenServer.call(pid, :snapshot) do
+      %{running: [_ | _]} = snapshot ->
+        snapshot
+
+      _ ->
+        Process.sleep(10)
+        running_snapshot(pid, attempts - 1)
+    end
   end
 
   defp isolate_config_dir do
