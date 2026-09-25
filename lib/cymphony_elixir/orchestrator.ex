@@ -55,6 +55,8 @@ defmodule CymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :runtime_agent,
+      :runtime_concurrency,
+      runtime_providers: %{},
       paused: false,
       running: %{},
       waiting: [],
@@ -1433,6 +1435,29 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
+  # Keep only fields the operator actually set. Copying the whole effective
+  # agent tuple here would freeze unrelated WORKFLOW.md defaults on reload.
+  defp merge_runtime_agent_overrides(previous, settings, new_config) do
+    overrides = previous || %{}
+
+    overrides =
+      if Agent.known_kind?(settings["agent"]) and is_map(new_config) do
+        Map.put(overrides, :kind, new_config.agent.kind)
+      else
+        overrides
+      end
+
+    overrides =
+      Enum.reduce([{"model", :model}, {"effort", :effort}], overrides, fn {source, target}, acc ->
+        case Map.fetch(settings, source) do
+          {:ok, value} when is_binary(value) -> Map.put(acc, target, empty_to_nil(value))
+          _ -> acc
+        end
+      end)
+
+    if map_size(overrides) == 0, do: nil, else: overrides
+  end
+
   defp max_retry_attempts(%State{} = state), do: state_config(state).agent.max_retry_attempts
 
   # Reschedule a failed issue, or abandon it once it has failed
@@ -1904,7 +1929,7 @@ defmodule CymphonyElixir.Orchestrator do
   def handle_call({:set_concurrency, n}, _from, state) when is_integer(n) and n > 0 do
     Logger.info("Concurrency updated: max_concurrent_agents=#{n}")
     notify_dashboard()
-    {:reply, :ok, %{state | max_concurrent_agents: n}}
+    {:reply, :ok, %{state | max_concurrent_agents: n, runtime_concurrency: n}}
   end
 
   def handle_call({:set_concurrency, _n}, _from, state) do
@@ -1915,19 +1940,25 @@ defmodule CymphonyElixir.Orchestrator do
       when is_list(providers) and providers != [] do
     Logger.info("Providers updated: providers=#{Enum.join(providers, ",")}")
 
+    kind = if is_map(state.config), do: state.config.agent.kind
+
     new_config =
       case state.config do
         nil ->
           state.config
 
         config ->
-          kind = config.agent.kind
           section = Agent.section(config, kind)
           Agent.put_section(config, kind, %{section | provider: hd(providers), providers: providers})
       end
 
+    runtime_providers =
+      if is_binary(kind),
+        do: Map.put(state.runtime_providers || %{}, kind, providers),
+        else: state.runtime_providers
+
     notify_dashboard()
-    {:reply, :ok, %{state | providers: providers, config: new_config}}
+    {:reply, :ok, %{state | providers: providers, config: new_config, runtime_providers: runtime_providers}}
   end
 
   def handle_call({:set_providers, _providers}, _from, state) do
@@ -1953,11 +1984,7 @@ defmodule CymphonyElixir.Orchestrator do
           %{config | agent: agent}
       end
 
-    runtime_agent =
-      case new_config do
-        %{agent: agent} -> %{kind: agent.kind, model: agent.model, effort: agent.effort}
-        _ -> nil
-      end
+    runtime_agent = merge_runtime_agent_overrides(state.runtime_agent, settings, new_config)
 
     Logger.info("Agent settings updated: #{inspect(Map.take(settings, ["agent", "model", "effort"]))}")
     notify_dashboard()
@@ -2217,23 +2244,6 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
-  # Loads config from the project's WorkflowStore, using project_name from state.
-  defp load_project_config(%State{project_name: project_name}) do
-    case ProjectSupervisor.lookup(project_name, :workflow_store) do
-      nil ->
-        Config.settings()
-
-      store_pid ->
-        case WorkflowStore.current(store_pid) do
-          {:ok, %{config: raw_config}} when is_map(raw_config) ->
-            Config.Schema.parse(raw_config)
-
-          _ ->
-            Config.settings()
-        end
-    end
-  end
-
   # Fallback: loads config from the global store.
   # Used by zero-arity helpers (terminal_state_set/0, active_state_set/0)
   # which are called from test helpers that don't carry state.
@@ -2241,52 +2251,58 @@ defmodule CymphonyElixir.Orchestrator do
     Config.settings!()
   end
 
-  defp refresh_runtime_config(%State{config: nil} = state) do
-    case load_project_config(state) do
-      {:ok, config} ->
-        config =
-          config
-          |> apply_config_json_overrides(state.project_name)
-          |> apply_runtime_agent_overrides(state.runtime_agent)
-          |> then(&apply_runtime_provider_overrides(nil, &1, state.providers))
+  defp refresh_runtime_config(%State{} = state) do
+    case load_runtime_workflow(state.project_name) do
+      {:ok, {config, prompt_template}} ->
+        apply_runtime_workflow(state, config, prompt_template)
 
-        %{
-          state
-          | config: config,
-            poll_interval_ms: config.polling.interval_ms,
-            max_concurrent_agents: state.max_concurrent_agents || config.agent.max_concurrent_agents,
-            providers: preserve_providers(state.providers, config)
-        }
-
-      {:error, _} ->
+      {:error, reason} ->
+        Logger.warning("Could not refresh workflow for project=#{state.project_name || "default"}: #{inspect(reason)}; keeping last known good configuration")
         state
     end
   end
 
-  defp refresh_runtime_config(%State{} = state) do
-    config =
-      case load_project_config(state) do
-        {:ok, new_config} ->
-          new_config
-          |> apply_config_json_overrides(state.project_name)
-          |> apply_runtime_agent_overrides(state.runtime_agent)
-          |> then(&apply_runtime_provider_overrides(state.config, &1, state.providers))
+  # Read config and prompt from one WorkflowStore version. Task 8A can move
+  # this disk/GenServer work to an async worker without carrying owner state.
+  defp load_runtime_workflow(project_name) do
+    workflow =
+      case project_name do
+        nil ->
+          CymphonyElixir.Workflow.current()
 
-        {:error, _} ->
-          state.config
+        name ->
+          case ProjectSupervisor.lookup(name, :workflow_store) do
+            nil -> CymphonyElixir.Workflow.current()
+            store_pid -> WorkflowStore.current(store_pid)
+          end
       end
+
+    with {:ok, %{config: raw_config, prompt_template: prompt_template}} when is_map(raw_config) <- workflow,
+         {:ok, config} <- Config.Schema.parse(raw_config) do
+      {:ok, {apply_config_json_overrides(config, project_name), prompt_template}}
+    else
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_workflow, other}}
+    end
+  end
+
+  # Owner-side application uses current controls, never a stale worker's copy.
+  # In particular, neither running RunSpecs nor the persisted pause flag move.
+  defp apply_runtime_workflow(%State{} = state, config, prompt_template) do
+    config =
+      config
+      |> apply_runtime_agent_overrides(state.runtime_agent)
+      |> apply_runtime_provider_overrides(state.runtime_providers)
 
     %{
       state
       | config: config,
+        prompt_template: prompt_template,
         poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: state.max_concurrent_agents || config.agent.max_concurrent_agents,
-        providers: preserve_providers(state.providers, config)
+        max_concurrent_agents: state.runtime_concurrency || config.agent.max_concurrent_agents,
+        providers: extract_providers(config)
     }
   end
-
-  defp preserve_providers([_ | _] = providers, _config), do: providers
-  defp preserve_providers(_, config), do: extract_providers(config)
 
   # Overlay ~/.cymphony/config.json so snapshot follows persisted agent/key
   # even when the temp WORKFLOW.md is stale. load/find failure is a no-op.
@@ -2345,38 +2361,23 @@ defmodule CymphonyElixir.Orchestrator do
   defp empty_to_nil(""), do: nil
   defp empty_to_nil(value), do: value
 
-  defp apply_runtime_agent_overrides(config, %{kind: kind, model: model, effort: effort}) when is_map(config) do
-    %{config | agent: %{config.agent | kind: kind, model: model, effort: effort}}
+  defp apply_runtime_agent_overrides(config, overrides) when is_map(config) and is_map(overrides) do
+    agent = Enum.reduce(overrides, config.agent, fn {key, value}, acc -> Map.put(acc, key, value) end)
+    %{config | agent: agent}
   end
 
   defp apply_runtime_agent_overrides(config, _runtime_agent), do: config
 
-  # Runtime set_providers updates live in State.providers and the active kind
-  # section. A WORKFLOW.md reload must not wipe those overrides, including
-  # provider lists previously written onto now-inactive kind sections.
-  defp apply_runtime_provider_overrides(old_config, new_config, runtime_providers) when is_map(new_config) do
-    active_kind = new_config.agent.kind
-
-    Enum.reduce(Agent.known_kinds(), new_config, fn kind, acc ->
-      old_sec = if is_map(old_config), do: Agent.section(old_config, kind), else: %{}
-      new_sec = Agent.section(acc, kind)
-
-      cond do
-        kind == active_kind and match?([_ | _], runtime_providers) ->
-          put_section_providers(acc, kind, new_sec, hd(runtime_providers), runtime_providers)
-
-        runtime_provider_fields?(old_sec) ->
-          put_section_providers(acc, kind, new_sec, Map.get(old_sec, :provider), Map.get(old_sec, :providers, []))
-
-        true ->
-          acc
-      end
+  # A provider control belongs to the kind active when it was issued. File
+  # defaults for every untouched kind remain free to reload.
+  defp apply_runtime_provider_overrides(config, runtime_providers) when is_map(runtime_providers) do
+    Enum.reduce(runtime_providers, config, fn {kind, providers}, acc ->
+      section = Agent.section(acc, kind)
+      put_section_providers(acc, kind, section, hd(providers), providers)
     end)
   end
 
-  defp runtime_provider_fields?(%{providers: [_ | _]}), do: true
-  defp runtime_provider_fields?(%{provider: provider}) when is_binary(provider) and provider != "", do: true
-  defp runtime_provider_fields?(_section), do: false
+  defp apply_runtime_provider_overrides(config, _runtime_providers), do: config
 
   defp put_section_providers(config, kind, section, provider, providers) do
     Agent.put_section(config, kind, %{section | provider: provider, providers: providers})
