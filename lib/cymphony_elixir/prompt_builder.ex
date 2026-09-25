@@ -23,6 +23,7 @@ defmodule CymphonyElixir.PromptBuilder do
           |> prompt_template!()
         end
       end
+      |> Config.normalize_workflow_prompt()
       |> parse_template!()
 
     template
@@ -42,7 +43,7 @@ defmodule CymphonyElixir.PromptBuilder do
     Config.workflow_prompt()
   end
 
-  defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
+  defp prompt_template!({:ok, %{prompt_template: prompt}}), do: prompt
 
   defp prompt_template!({:error, reason}) do
     raise RuntimeError, "workflow_unavailable: #{inspect(reason)}"
@@ -70,12 +71,4 @@ defmodule CymphonyElixir.PromptBuilder do
   defp to_solid_value(value) when is_map(value), do: to_solid_map(value)
   defp to_solid_value(value) when is_list(value), do: Enum.map(value, &to_solid_value/1)
   defp to_solid_value(value), do: value
-
-  defp default_prompt(prompt) when is_binary(prompt) do
-    if String.trim(prompt) == "" do
-      Config.workflow_prompt()
-    else
-      prompt
-    end
-  end
 end

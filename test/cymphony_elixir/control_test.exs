@@ -467,70 +467,50 @@ defmodule CymphonyElixirWeb.ControlTest do
       refute Map.has_key?(Enum.find(cfg["projects"], &(&1["name"] == "beta")), "dispatch_paused")
     end
 
-    test "set_queue_pin overlays a non-map existing pin and can delete an empty pin", %{tmp: tmp} do
-      File.write!(
-        Path.join(tmp, "config.json"),
-        Jason.encode!(%{
-          "projects" => [
-            %{"name" => "alpha", "queue_pins" => %{"LLM-51" => "bad", "LLM-12" => %{"model" => "m"}}}
-          ]
-        })
-      )
-
+    test "set_queue_pin rejects a malformed stored pin without replacing siblings", %{tmp: tmp} do
+      original = %{"projects" => [%{"name" => "alpha", "queue_pins" => %{"LLM-51" => "bad", "LLM-12" => %{"model" => "m"}}}]}
+      path = Path.join(tmp, "config.json")
+      File.write!(path, Jason.encode!(original))
       start_orch!("alpha")
 
-      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"effort" => "high"}) == :ok
+      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"effort" => "high"}) == {:error, :invalid_queue_pin}
       assert_receive {:orch, _, {:set_queue_run_spec, "LLM-51", %{"effort" => "high"}}}
-      {:ok, cfg} = Jason.decode(File.read!(Path.join(tmp, "config.json")))
-      alpha = Enum.find(cfg["projects"], &(&1["name"] == "alpha"))
-      assert alpha["queue_pins"]["LLM-51"] == %{"effort" => "high"}
-      assert alpha["queue_pins"]["LLM-12"] == %{"model" => "m"}
+      assert Jason.decode!(File.read!(path)) == original
+    end
+
+    test "set_queue_pin deletes an empty pin without replacing siblings", %{tmp: tmp} do
+      original = %{"projects" => [%{"name" => "alpha", "queue_pins" => %{"LLM-51" => %{"effort" => "high"}, "LLM-12" => %{"model" => "m"}}}]}
+      path = Path.join(tmp, "config.json")
+      File.write!(path, Jason.encode!(original))
+      start_orch!("alpha")
 
       assert Control.set_queue_pin({:project, "alpha"}, "LLM-12", %{}) == :ok
       assert_receive {:orch, _, {:set_queue_run_spec, "LLM-12", %{}}}
-      {:ok, cfg} = Jason.decode(File.read!(Path.join(tmp, "config.json")))
-      alpha = Enum.find(cfg["projects"], &(&1["name"] == "alpha"))
-      refute Map.has_key?(alpha["queue_pins"], "LLM-12")
+      assert hd(Jason.decode!(File.read!(path))["projects"])["queue_pins"] == %{"LLM-51" => %{"effort" => "high"}}
     end
 
-    test "set_queue_pin with no orchestrators reads top-level pins when projects is empty", %{tmp: tmp} do
+    test "set_queue_pin reports a missing named project without changing top-level pins", %{tmp: tmp} do
       File.write!(
         Path.join(tmp, "config.json"),
         Jason.encode!(%{"projects" => [], "queue_pins" => %{"LLM-1" => %{"model" => "opus"}}})
       )
 
-      assert Control.set_queue_pin({:project, "alpha"}, "LLM-1", %{"effort" => "high"}) == :ok
+      assert Control.set_queue_pin({:project, "alpha"}, "LLM-1", %{"effort" => "high"}) == {:error, :project_not_found}
 
       {:ok, cfg} = Jason.decode(File.read!(Path.join(tmp, "config.json")))
       assert cfg["projects"] == []
       assert cfg["queue_pins"] == %{"LLM-1" => %{"model" => "opus"}}
     end
 
-    test "set_queue_pin treats a non-map pins value as empty", %{tmp: tmp} do
-      File.write!(
-        Path.join(tmp, "config.json"),
-        Jason.encode!(%{
-          "projects" => [
-            %{"name" => "alpha", "queue_pins" => "legacy"},
-            %{"name" => "beta"}
-          ]
-        })
-      )
-
+    test "set_queue_pin rejects a malformed stored pins map without overwriting it", %{tmp: tmp} do
+      original = %{"projects" => [%{"name" => "alpha", "queue_pins" => "legacy"}, %{"name" => "beta"}]}
+      path = Path.join(tmp, "config.json")
+      File.write!(path, Jason.encode!(original))
       start_orch!("alpha")
 
-      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"effort" => "high"}) == :ok
+      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"effort" => "high"}) == {:error, :invalid_queue_pin}
       assert_receive {:orch, _, {:set_queue_run_spec, "LLM-51", %{"effort" => "high"}}}
-      {:ok, cfg} = Jason.decode(File.read!(Path.join(tmp, "config.json")))
-      alpha = Enum.find(cfg["projects"], &(&1["name"] == "alpha"))
-      assert alpha["queue_pins"] == %{"LLM-51" => %{"effort" => "high"}}
-
-      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"model" => "opus"}) == :ok
-      assert_receive {:orch, _, {:set_queue_run_spec, "LLM-51", %{"model" => "opus"}}}
-      {:ok, cfg} = Jason.decode(File.read!(Path.join(tmp, "config.json")))
-      alpha = Enum.find(cfg["projects"], &(&1["name"] == "alpha"))
-      assert alpha["queue_pins"]["LLM-51"]["effort"] == "high"
-      assert alpha["queue_pins"]["LLM-51"]["model"] == "opus"
+      assert Jason.decode!(File.read!(path)) == original
     end
 
     test "set_queue_pin with a registered name missing from config does not invent a project", %{
@@ -539,7 +519,7 @@ defmodule CymphonyElixirWeb.ControlTest do
       File.write!(Path.join(tmp, "config.json"), Jason.encode!(%{"projects" => [%{"name" => "beta"}]}))
       start_orch!("alpha")
 
-      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"effort" => "high"}) == :ok
+      assert Control.set_queue_pin({:project, "alpha"}, "LLM-51", %{"effort" => "high"}) == {:error, :project_not_found}
       assert_receive {:orch, _, {:set_queue_run_spec, "LLM-51", %{"effort" => "high"}}}
       {:ok, cfg} = Jason.decode(File.read!(Path.join(tmp, "config.json")))
       assert cfg["projects"] == [%{"name" => "beta"}]

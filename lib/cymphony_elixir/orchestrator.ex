@@ -678,7 +678,8 @@ defmodule CymphonyElixir.Orchestrator do
   defp revalidate_intent(nil, _config, _terminal), do: {:skip, :missing}
 
   defp revalidate_intent(issue, config, terminal) do
-    revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, config), terminal)
+    active = config.tracker.active_states |> Enum.map(&normalize_issue_state/1) |> MapSet.new()
+    revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, config), active, terminal)
   end
 
   defp retry_token(state, id), do: get_in(state.retry_attempts, [id, :retry_token])
@@ -788,7 +789,7 @@ defmodule CymphonyElixir.Orchestrator do
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
-    revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+    revalidate_issue_for_dispatch(issue, issue_fetcher, active_state_set(), terminal_state_set())
   end
 
   @doc false
@@ -1130,7 +1131,7 @@ defmodule CymphonyElixir.Orchestrator do
       Map.get(
         config.agent.max_concurrent_agents_by_state,
         normalize_issue_state(issue_state),
-        config.agent.max_concurrent_agents
+        state.max_concurrent_agents || config.agent.max_concurrent_agents
       )
 
     used = running_issue_count_for_state(Map.merge(state.work.retiring, running), issue_state)
@@ -1483,11 +1484,11 @@ defmodule CymphonyElixir.Orchestrator do
     })
   end
 
-  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
+  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, active_states, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue, terminal_states) do
+        if retry_candidate_issue?(refreshed_issue, active_states, terminal_states) do
           {:ok, refreshed_issue}
         else
           {:skip, refreshed_issue}
@@ -1501,7 +1502,7 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _active_states, _terminal_states), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id, running_entry) do
     record = build_completed_record(issue_id, running_entry, state.project_name)
@@ -1593,7 +1594,7 @@ defmodule CymphonyElixir.Orchestrator do
             retry_token: retry_token,
             due_at_ms: due_at_ms,
             identifier: identifier,
-            error: error,
+            error: PublicEvent.sanitize(error),
             worker_host: worker_host,
             workspace_path: workspace_path,
             failures: failures
@@ -1764,9 +1765,12 @@ defmodule CymphonyElixir.Orchestrator do
     config = state_config(state)
     days = config.workspace.retention_days
 
-    if is_integer(days) do
+    # A hook can own the workspace before runtime metadata arrives. Defer
+    # conservatively rather than treating an unknown owned path as unoccupied.
+    exclude = owned_workspace_paths(state)
+
+    if is_integer(days) and is_list(exclude) do
       root = config.workspace.root
-      exclude = running_workspace_paths(state)
 
       case Workspace.clean_stale(root,
              days: days,
@@ -1788,12 +1792,13 @@ defmodule CymphonyElixir.Orchestrator do
     :ok
   end
 
-  defp running_workspace_paths(%State{running: running}) do
-    running
-    |> Enum.flat_map(fn {_id, metadata} ->
+  defp owned_workspace_paths(%State{} = state) do
+    state.work.retiring
+    |> Map.merge(state.running)
+    |> Enum.reduce_while([], fn {_id, metadata}, paths ->
       case Map.get(metadata, :workspace_path) do
-        path when is_binary(path) -> [path]
-        _ -> []
+        path when is_binary(path) -> {:cont, [path | paths]}
+        _ -> {:halt, :unknown}
       end
     end)
   end
@@ -1942,9 +1947,13 @@ defmodule CymphonyElixir.Orchestrator do
 
     Logger.error("Abandoning issue_id=#{issue_id} issue_identifier=#{identifier} after #{failures} consecutive failed attempts; last error=#{inspect(metadata[:error])}")
 
+    # Local logs above retain the original diagnostic. Only the outward-facing
+    # error crosses the same bounded/redacted boundary as retained retry errors.
+    error = PublicEvent.sanitize(metadata[:error])
+
     state =
       queue_effect(state, {:issue, issue_id}, fn ->
-        post_abandon_comment(state, issue_id, identifier, failures, metadata[:error])
+        post_abandon_comment(state, issue_id, identifier, failures, error)
         move_to_failure_state(state, issue_id, identifier)
 
         cleanup_issue_workspace(
@@ -2716,7 +2725,7 @@ defmodule CymphonyElixir.Orchestrator do
   defp parse_project_workflow_config(project_name, raw_config, prompt_template) do
     case Config.Schema.parse(raw_config) do
       {:ok, settings} ->
-        {settings, prompt_template}
+        {settings, Config.normalize_workflow_prompt(prompt_template)}
 
       {:error, reason} ->
         Logger.warning("Failed to parse config for project '#{project_name}': #{inspect(reason)}; falling back to global config")
@@ -2749,7 +2758,7 @@ defmodule CymphonyElixir.Orchestrator do
 
     with {:ok, %{config: raw_config, prompt_template: prompt_template}} when is_map(raw_config) <- workflow,
          {:ok, config} <- Config.Schema.parse(raw_config) do
-      {:ok, {apply_config_json_overrides(config, project_name), prompt_template}}
+      {:ok, {apply_config_json_overrides(config, project_name), Config.normalize_workflow_prompt(prompt_template)}}
     else
       {:error, reason} -> {:error, reason}
     end
@@ -2854,11 +2863,6 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, active_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
-  end
-
-  defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 

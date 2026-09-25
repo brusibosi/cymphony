@@ -162,7 +162,7 @@ defmodule CymphonyElixir.Workspace do
 
   @doc """
   Sweeps `workspace_root` for top-level directories whose last-modified time is older than
-  `:days`. Skips paths in `:exclude_paths` (e.g. currently-running workspaces).
+  `:days`. Skips paths in `:exclude_paths` and their sibling session logs.
 
   Returns `{:ok, removed}` after deletion, or `{:dry_run, would_remove}` when `dry_run: true`.
   Both `removed` and `would_remove` are lists of absolute paths.
@@ -173,7 +173,14 @@ defmodule CymphonyElixir.Workspace do
   def clean_stale(workspace_root, opts) when is_binary(workspace_root) do
     days = Keyword.fetch!(opts, :days)
     dry_run = Keyword.get(opts, :dry_run, false)
-    exclude = Keyword.get(opts, :exclude_paths, []) |> MapSet.new()
+
+    # Runtime metadata uses physical paths; the configured root may name a
+    # symlink (for example /var on macOS). Compare canonical identities.
+    exclude =
+      opts
+      |> Keyword.get(:exclude_paths, [])
+      |> Enum.flat_map(fn path -> [path, Path.join(Path.dirname(path), @session_log_prefix <> Path.basename(path) <> ".log")] end)
+      |> MapSet.new(&PathSafety.canonicalize/1)
 
     cutoff = DateTime.utc_now() |> DateTime.add(-days * 86_400, :second)
 
@@ -220,7 +227,7 @@ defmodule CymphonyElixir.Workspace do
   end
 
   defp stale_candidate?(path, exclude, cutoff) do
-    sweepable?(path) and not MapSet.member?(exclude, path) and stale?(path, cutoff)
+    sweepable?(path) and not MapSet.member?(exclude, PathSafety.canonicalize(path)) and stale?(path, cutoff)
   end
 
   # Directories are the workspaces themselves. The one plain file the sweep also

@@ -67,11 +67,17 @@ defmodule CymphonyElixir.Config do
   def workflow_prompt do
     case Workflow.current() do
       {:ok, %{prompt_template: prompt}} ->
-        if String.trim(prompt) == "", do: @default_prompt_template, else: prompt
+        normalize_workflow_prompt(prompt)
 
       _ ->
         @default_prompt_template
     end
+  end
+
+  @doc "Uses the built-in prompt for a blank body without consulting any workflow store."
+  @spec normalize_workflow_prompt(String.t()) :: String.t()
+  def normalize_workflow_prompt(prompt) when is_binary(prompt) do
+    if String.trim(prompt) == "", do: @default_prompt_template, else: prompt
   end
 
   @spec server_port() :: non_neg_integer() | nil

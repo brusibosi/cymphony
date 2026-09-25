@@ -224,6 +224,64 @@ defmodule CymphonyElixir.Orchestrator.RetiringOwnershipTest do
     refute File.exists?(stale)
   end
 
+  for metadata <- [:known, :pending] do
+    test "retention protects retiring workspace and sibling log with #{metadata} metadata until positive reap" do
+      root = Path.dirname(Workflow.workflow_file_path())
+      physical_root = Path.join(root, "physical-workspaces")
+      File.mkdir_p!(physical_root)
+      File.ln_s!(physical_root, Path.join(root, "workspaces"))
+      pidfile = Path.join(root, "retiring-cli.pids")
+
+      opts =
+        if unquote(metadata) == :pending,
+          do: [hook_after_create: "echo $$ >> '#{pidfile}'; exec /bin/sleep 60"],
+          else: []
+
+      {orchestrator, pidfile} = runtime(opts)
+      {worker, guard} = suspend_running_guard(orchestrator)
+      old_pid = hd(cli_pids(pidfile))
+      workspace = Path.join(root, "workspaces/RETIRE-A")
+      log = Path.join(root, "workspaces/.agy-RETIRE-A.log")
+      File.write!(log, "local session diagnostic")
+      for path <- [workspace, log], do: File.touch!(path, System.os_time(:second) - 172_800)
+
+      :sys.replace_state(orchestrator, fn state ->
+        %{state | config: %{state.config | workspace: %{state.config.workspace | retention_days: 1}}}
+      end)
+
+      try do
+        if unquote(metadata) == :pending do
+          assert :sys.get_state(orchestrator).running["retire-a"].workspace_path == nil
+        end
+
+        assert :ok = GenServer.call(orchestrator, {:kill_issue, "retire-a"}, 100)
+        eventually(fn -> not Process.alive?(worker) end)
+        send(orchestrator, :workspace_sweep)
+        eventually(fn -> not sweep_active?(orchestrator) end)
+        assert :ok = GenServer.call(orchestrator, :pause, 100)
+        assert Orchestrator.snapshot(orchestrator, 100).running == []
+        assert map_size(:sys.get_state(orchestrator).work.retiring) == 1
+        assert alive?(old_pid)
+        assert File.dir?(workspace)
+        assert File.exists?(log)
+      after
+        resume_guard(guard)
+      end
+
+      eventually(fn -> map_size(:sys.get_state(orchestrator).work.retiring) == 0 end)
+      refute alive?(old_pid)
+      send(orchestrator, :workspace_sweep)
+      eventually(fn -> not File.exists?(workspace) and not File.exists?(log) end)
+    end
+  end
+
+  defp sweep_active?(orchestrator) do
+    state = :sys.get_state(orchestrator)
+
+    Map.has_key?(state.work.effect_queue, :sweep) or
+      Enum.any?(state.work.io_jobs, fn {_ref, job} -> job.key == {:effect, :sweep} end)
+  end
+
   defp runtime(opts \\ []) do
     root = Path.dirname(Workflow.workflow_file_path())
     pidfile = Path.join(root, "retiring-cli.pids")
