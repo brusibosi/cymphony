@@ -19,8 +19,9 @@ defmodule CymphonyElixir.PresenterFanoutTest do
       {:ok, {name, owner, snapshot, hold?}}
     end
 
-    def handle_call(:snapshot, _from, {name, owner, snapshot, hold?} = state) do
+    def handle_call(:snapshot, {worker, _call_ref}, {name, owner, snapshot, hold?} = state) do
       send(owner, {:snapshot_started, name, self()})
+      send(owner, {:snapshot_worker_started, name, worker})
 
       if hold? do
         receive do
@@ -120,6 +121,33 @@ defmodule CymphonyElixir.PresenterFanoutTest do
     assert elapsed < 1_500
   end
 
+  test "a blocked snapshot worker dies when its aggregation caller dies" do
+    start_project("blocked", true)
+    {caller, caller_ref} = spawn_monitor(fn -> Presenter.state_payload(Module.concat(__MODULE__, :NoLegacy), 5_000) end)
+
+    assert_receive {:snapshot_worker_started, "blocked", worker}, 1_000
+    worker_ref = Process.monitor(worker)
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}, 1_000
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker, _reason}, 1_000
+  end
+
+  test "a completed snapshot reaps its owner guardian" do
+    server = start_project("normal", true)
+    task = Task.async(fn -> Presenter.state_payload(Module.concat(__MODULE__, :NoLegacy), 5_000) end)
+
+    assert_receive {:snapshot_worker_started, "normal", worker}, 1_000
+    guardian = wait_for_guardian(worker, task.pid)
+    assert is_pid(guardian)
+    guardian_ref = Process.monitor(guardian)
+
+    send(server, :release_snapshot)
+    assert %{projects: [%{name: "normal"}]} = Task.await(task, 1_000)
+    assert_receive {:DOWN, ^guardian_ref, :process, ^guardian, _reason}, 1_000
+  end
+
   test "projects payload fans out rather than waiting for a stalled earlier project" do
     start_project("01-slow", true)
     start_project("02-fast", false)
@@ -163,5 +191,24 @@ defmodule CymphonyElixir.PresenterFanoutTest do
     )
 
     start_supervised!({CymphonyElixirWeb.Endpoint, []})
+  end
+
+  defp wait_for_guardian(worker, owner, attempts \\ 100)
+
+  defp wait_for_guardian(_worker, _owner, 0), do: nil
+
+  defp wait_for_guardian(worker, owner, attempts) do
+    guardian =
+      case Process.info(worker, :monitored_by) do
+        {:monitored_by, pids} -> Enum.find(pids, &(&1 != owner))
+        nil -> nil
+      end
+
+    if guardian do
+      guardian
+    else
+      Process.sleep(10)
+      wait_for_guardian(worker, owner, attempts - 1)
+    end
   end
 end

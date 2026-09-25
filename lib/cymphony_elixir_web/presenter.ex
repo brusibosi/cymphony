@@ -665,6 +665,18 @@ defmodule CymphonyElixirWeb.Presenter do
       try do
         {worker, ref} =
           spawn_monitor(fn ->
+            worker = self()
+
+            spawn(fn ->
+              owner_ref = Process.monitor(owner)
+              worker_ref = Process.monitor(worker)
+
+              receive do
+                {:DOWN, ^owner_ref, :process, _pid, _reason} -> Process.exit(worker, :kill)
+                {:DOWN, ^worker_ref, :process, _pid, _reason} -> :ok
+              end
+            end)
+
             send(owner, {:snapshot_result, self(), Orchestrator.snapshot(pid, remaining)})
           end)
 
