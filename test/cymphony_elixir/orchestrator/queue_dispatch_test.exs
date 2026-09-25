@@ -346,6 +346,25 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
     end)
   end
 
+  test "set_queue_run_spec preserves pins written after the orchestrator loaded its state" do
+    project_name = "concurrent-pins-#{System.unique_integer([:positive])}"
+
+    with_config_dir(fn _tmp ->
+      :ok = CymphonyConfig.save(%{"projects" => [%{"name" => project_name, "queue_pins" => %{}}]})
+      pid = start_queue_orchestrator(:ConcurrentPins, slots: 0, project_name: project_name)
+
+      assert {:ok, _} =
+               CymphonyConfig.update_project_queue_pin(project_name, "EXTERNAL-1", %{"effort" => "low"})
+
+      assert :ok = Orchestrator.set_queue_run_spec(pid, "LOCAL-1", %{model: "new-model"})
+
+      {:ok, config} = CymphonyConfig.load()
+      pins = hd(config["projects"])["queue_pins"]
+      assert pins["EXTERNAL-1"] == %{"effort" => "low"}
+      assert pins["LOCAL-1"] == %{"model" => "new-model"}
+    end)
+  end
+
   defp start_queue_orchestrator(suffix, opts \\ []) do
     isolate_config_dir()
 

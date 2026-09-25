@@ -2,12 +2,21 @@ defmodule CymphonyElixir.Cymphony.ShellProvider do
   @moduledoc false
 
   @default_env_prefixes ~w(ANTHROPIC_ API_TIMEOUT CLAUDE_CODE_)
+  @safe_function_name ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
+
+  @spec valid_name?(term()) :: boolean()
+  def valid_name?(name) when is_binary(name), do: Regex.match?(@safe_function_name, name)
+  def valid_name?(_name), do: false
 
   @spec load_env(String.t(), [String.t()]) :: {:ok, map()} | {:error, :not_found}
   def load_env(provider_name, prefixes \\ @default_env_prefixes) when is_binary(provider_name) do
-    case cached({provider_name, prefixes}) do
-      {:ok, _} = result -> result
-      :miss -> fetch_and_cache(provider_name, prefixes)
+    if valid_name?(provider_name) do
+      case cached({provider_name, prefixes}) do
+        {:ok, _} = result -> result
+        :miss -> fetch_and_cache(provider_name, prefixes)
+      end
+    else
+      {:error, :not_found}
     end
   end
 
@@ -77,9 +86,9 @@ defmodule CymphonyElixir.Cymphony.ShellProvider do
       {_output, 1} ->
         {:error, :not_found}
 
-      {output, code} ->
+      {_output, code} ->
         require Logger
-        Logger.warning("ShellProvider exited #{code} for #{provider_name}: #{String.slice(output, 0, 200)}")
+        Logger.warning("ShellProvider exited #{code} for #{provider_name}")
         {:error, :not_found}
     end
   end

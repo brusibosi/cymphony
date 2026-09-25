@@ -12,6 +12,7 @@ defmodule CymphonyElixir.Agent.Runner do
   require Logger
 
   alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text}
+  alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
 
@@ -297,7 +298,15 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp provider_env(provider_name, agent_module)
        when is_binary(provider_name) and provider_name != "" do
-    case ShellProvider.load_env(provider_name, agent_module.auth_env_prefixes()) do
+    prefixes = agent_module.auth_env_prefixes()
+
+    result =
+      case CymphonyConfig.provider_env(provider_name, prefixes) do
+        {:ok, env_map} -> {:ok, env_map}
+        :not_found -> ShellProvider.load_env(provider_name, prefixes)
+      end
+
+    case result do
       {:ok, env_map} when is_map(env_map) ->
         normalize_env_map(env_map)
 

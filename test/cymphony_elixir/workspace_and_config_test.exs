@@ -39,6 +39,36 @@ defmodule CymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "after_create hooks for separate workspaces serialize across tasks" do
+    root = Path.join(System.tmp_dir!(), "cymphony-after-create-lock-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    critical = Path.join(root, "critical")
+
+    try do
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "mkdir '#{critical}'; sleep 0.05; rmdir '#{critical}'; echo ready > README.md"
+      )
+
+      results =
+        1..8
+        |> Task.async_stream(fn n -> Workspace.create_for_issue("LOCK-#{n}") end,
+          max_concurrency: 8,
+          timeout: 10_000
+        )
+        |> Enum.to_list()
+
+      assert Enum.all?(results, fn
+               {:ok, {:ok, path}} -> File.read!(Path.join(path, "README.md")) == "ready\n"
+               _ -> false
+             end)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(

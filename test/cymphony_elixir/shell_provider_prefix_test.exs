@@ -161,10 +161,25 @@ defmodule CymphonyElixir.ShellProviderPrefixTest do
     assert ShellProvider.load_env(unique_provider()) == {:error, :not_found}
   end
 
+  test "rejects unsafe provider aliases before invoking any shell" do
+    stub_cmd(fn _, _, _ -> flunk("unsafe alias reached shell") end)
+
+    for alias_name <- ["cz; touch /tmp/unsafe", "$(id)", "cz\nrm -rf /", "-cz", "cz/name"] do
+      assert ShellProvider.load_env(alias_name) == {:error, :not_found}
+    end
+  end
+
+  test "valid_name?/1 accepts safe shell function identifiers only" do
+    assert ShellProvider.valid_name?("cz_2")
+    assert ShellProvider.valid_name?("ag")
+    refute ShellProvider.valid_name?("cz; echo leak")
+    refute ShellProvider.valid_name?(nil)
+  end
+
   test "load_env logs and returns :not_found when zsh exits with an unexpected code" do
     name = unique_provider()
 
-    stub_cmd(fn "zsh", ["-c", _script], _opts -> {"provider blew up", 2} end)
+    stub_cmd(fn "zsh", ["-c", _script], _opts -> {"ANTHROPIC_API_KEY=sk-sensitive", 2} end)
 
     log =
       capture_log(fn ->
@@ -172,6 +187,6 @@ defmodule CymphonyElixir.ShellProviderPrefixTest do
       end)
 
     assert log =~ "ShellProvider exited 2 for #{name}"
-    assert log =~ "provider blew up"
+    refute log =~ "sk-sensitive"
   end
 end

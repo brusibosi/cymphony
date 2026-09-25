@@ -465,6 +465,57 @@ defmodule CymphonyElixir.Agent.RunnerTest do
     end
   end
 
+  test "config provider env wins over shell provider and filters other agent secrets" do
+    root = Path.join(System.tmp_dir!(), "cymphony-provider-map-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-CONFIG-PROVIDER")
+    binary = Path.join(root, "fake-claude")
+    trace = Path.join(root, "env.trace")
+    previous_config_dir = Application.get_env(:cymphony_elixir, :config_dir_override)
+    previous_shell_cmd = Application.get_env(:cymphony_elixir, :shell_provider_cmd)
+
+    try do
+      File.mkdir_p!(workspace)
+      Application.put_env(:cymphony_elixir, :config_dir_override, root)
+
+      Application.put_env(:cymphony_elixir, :shell_provider_cmd, fn _, _, _ ->
+        flunk("config provider must not invoke shell fallback")
+      end)
+
+      :ok =
+        CymphonyElixir.Cymphony.Config.save(%{
+          "projects" => [],
+          "providers" => %{
+            "cz" => %{
+              "ANTHROPIC_API_KEY" => "from-config",
+              "OPENAI_API_KEY" => "wrong-agent"
+            }
+          }
+        })
+
+      File.write!(
+        binary,
+        "#!/bin/sh\nprintf 'ANTHROPIC_API_KEY=%s\\nOPENAI_API_KEY=%s\\n' \"$ANTHROPIC_API_KEY\" \"$OPENAI_API_KEY\" > '#{trace}'\necho '{\"result\":\"done\",\"session_id\":\"configured\"}'\n"
+      )
+
+      File.chmod!(binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        claude_command: binary,
+        claude_provider: "cz"
+      )
+
+      issue = %Issue{id: "provider-map", identifier: "MT-CONFIG-PROVIDER", title: "Auth", description: "", state: "In Progress", url: "https://example.test/issue", labels: []}
+      assert {:ok, %{session_id: "configured"}} = Runner.run(workspace, "go", issue)
+      assert File.read!(trace) == "ANTHROPIC_API_KEY=from-config\nOPENAI_API_KEY=\n"
+    after
+      if previous_config_dir, do: Application.put_env(:cymphony_elixir, :config_dir_override, previous_config_dir), else: Application.delete_env(:cymphony_elixir, :config_dir_override)
+      if previous_shell_cmd, do: Application.put_env(:cymphony_elixir, :shell_provider_cmd, previous_shell_cmd), else: Application.delete_env(:cymphony_elixir, :shell_provider_cmd)
+      File.rm_rf(root)
+    end
+  end
+
   test "app server exports Linear and GitHub auth env to ssh Claude process" do
     test_root =
       Path.join(

@@ -51,6 +51,14 @@ defmodule CymphonyElixir.Cymphony.ConfigPersistenceTest do
       assert {:error, msg} = CymphonyConfig.load()
       assert msg =~ "Invalid JSON in #{path}"
     end
+
+    test "rejects valid non-object JSON without raising", %{path: path} do
+      for value <- ["[]", "null", "42", ~s("hello")] do
+        File.write!(path, value)
+        assert {:error, message} = CymphonyConfig.load()
+        assert message =~ "Invalid config in #{path}"
+      end
+    end
   end
 
   describe "save/1" do
@@ -83,6 +91,53 @@ defmodule CymphonyElixir.Cymphony.ConfigPersistenceTest do
     test "returns an encode error for values Jason cannot serialize", %{tmp: _tmp} do
       assert {:error, %Protocol.UndefinedError{protocol: Jason.Encoder}} =
                CymphonyConfig.save(%{"pid" => self()})
+    end
+  end
+
+  describe "provider_env/2" do
+    test "resolves top-level provider maps with agent-specific filtering", %{path: path} do
+      write_config!(path, %{
+        "projects" => [%{"name" => "alpha", "providers" => ["cz"]}],
+        "providers" => %{
+          "cz" => %{
+            "ANTHROPIC_API_KEY" => "from-config",
+            "OPENAI_API_KEY" => "wrong-agent",
+            "API_TIMEOUT" => "30",
+            "PATH" => "/unsafe",
+            "ANTHROPIC_MODEL" => 123
+          }
+        }
+      })
+
+      assert CymphonyConfig.provider_env("cz", ["ANTHROPIC_", "API_TIMEOUT"]) ==
+               {:ok, %{"ANTHROPIC_API_KEY" => "from-config", "API_TIMEOUT" => "30"}}
+
+      assert CymphonyConfig.provider_env("cz", ["OPENAI_"]) ==
+               {:ok, %{"OPENAI_API_KEY" => "wrong-agent"}}
+
+      assert CymphonyConfig.provider_env("missing", ["ANTHROPIC_"]) == :not_found
+    end
+  end
+
+  describe "update_project_queue_pin/3" do
+    test "merges simultaneous per-issue patches without losing another pin", %{path: path} do
+      write_config!(path, %{"projects" => [%{"name" => "alpha", "queue_pins" => %{}}]})
+
+      1..20
+      |> Task.async_stream(
+        fn n ->
+          CymphonyConfig.update_project_queue_pin("alpha", "ISSUE-#{n}", %{"model" => "m#{n}"})
+        end,
+        max_concurrency: 20,
+        timeout: 10_000
+      )
+      |> Enum.each(fn {:ok, result} -> assert {:ok, _pins} = result end)
+
+      assert {:ok, config} = CymphonyConfig.load()
+      pins = hd(config["projects"])["queue_pins"]
+      assert map_size(pins) == 20
+      assert pins["ISSUE-1"] == %{"model" => "m1"}
+      assert pins["ISSUE-20"] == %{"model" => "m20"}
     end
   end
 

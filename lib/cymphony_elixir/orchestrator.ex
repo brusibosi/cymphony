@@ -1979,11 +1979,15 @@ defmodule CymphonyElixir.Orchestrator do
 
   def handle_call({:set_queue_run_spec, issue_key, pin}, _from, state)
       when is_binary(issue_key) and issue_key != "" and is_map(pin) do
-    queue_pins = apply_queue_pin(state.queue_pins, issue_key, pin)
+    queue_pins =
+      case CymphonyConfig.update_project_queue_pin(state.project_name, issue_key, pin) do
+        {:ok, persisted_pins} ->
+          parse_loaded_queue_pins(%{"queue_pins" => persisted_pins})
 
-    persist_project_queue(state.project_name, %{
-      "queue_pins" => persistable_queue_pins(queue_pins)
-    })
+        {:error, reason} ->
+          Logger.warning("event=\"queue.persist\" status=error reason=#{inspect(reason)}")
+          apply_queue_pin(state.queue_pins, issue_key, pin)
+      end
 
     notify_dashboard()
     {:reply, :ok, %{state | queue_pins: queue_pins}}
@@ -2638,16 +2642,6 @@ defmodule CymphonyElixir.Orchestrator do
   defp put_normalized_pin(pin, _key, nil), do: pin
   defp put_normalized_pin(pin, key, value), do: Map.put(pin, key, value)
 
-  defp json_pin(pin) when is_map(pin) do
-    %{}
-    |> maybe_put_json_pin("agent_kind", pin_field(pin, :agent_kind))
-    |> maybe_put_json_pin("model", pin_field(pin, :model))
-    |> maybe_put_json_pin("effort", pin_field(pin, :effort))
-  end
-
-  defp maybe_put_json_pin(map, _key, nil), do: map
-  defp maybe_put_json_pin(map, key, value), do: Map.put(map, key, value)
-
   defp apply_queue_pin(pins, issue_key, pin) when is_map(pins) and is_map(pin) do
     if pin == %{} do
       Map.delete(pins, issue_key)
@@ -2660,17 +2654,5 @@ defmodule CymphonyElixir.Orchestrator do
         Map.put(pins, issue_key, merged)
       end
     end
-  end
-
-  defp persistable_queue_pins(pins) when is_map(pins) do
-    Enum.reduce(pins, %{}, fn {key, pin}, acc ->
-      encoded = json_pin(pin)
-
-      if encoded == %{} do
-        acc
-      else
-        Map.put(acc, to_string(key), encoded)
-      end
-    end)
   end
 end
