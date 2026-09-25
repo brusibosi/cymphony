@@ -275,7 +275,7 @@ defmodule CymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
+      case fetch_retry_attempt_state(state, issue_id, retry_token) do
         {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
         :missing -> {:noreply, state}
       end
@@ -835,7 +835,7 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, opts \\ []) do
+  defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, opts) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, state.config), terminal_state_set(state)) do
       {:ok, %Issue{} = refreshed_issue} ->
         transition_to_in_progress(refreshed_issue, state)
@@ -843,18 +843,38 @@ defmodule CymphonyElixir.Orchestrator do
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
-        state
+        release_skipped_retry(state, issue, attempt)
 
       {:skip, %Issue{} = refreshed_issue} ->
         Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
 
-        state
+        if is_integer(attempt) and terminal_issue_state?(refreshed_issue.state, terminal_state_set(state)) do
+          cleanup_issue_workspace(refreshed_issue.identifier, preferred_worker_host, state_config(state))
+        end
+
+        release_skipped_retry(state, issue, attempt)
 
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        reschedule_failed_retry_refresh(state, issue, attempt, reason)
     end
   end
+
+  defp release_skipped_retry(state, %Issue{id: issue_id}, attempt) when is_integer(attempt) do
+    release_retry_claim(state, issue_id)
+  end
+
+  defp release_skipped_retry(state, _issue, _attempt), do: state
+
+  defp reschedule_failed_retry_refresh(state, %Issue{} = issue, attempt, reason)
+       when is_integer(attempt) do
+    schedule_issue_retry(state, issue.id, attempt + 1, %{
+      identifier: issue.identifier,
+      error: "dispatch refresh failed: #{inspect(reason)}"
+    })
+  end
+
+  defp reschedule_failed_retry_refresh(state, _issue, _attempt, _reason), do: state
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, opts) do
     recipient = self()
@@ -862,7 +882,15 @@ defmodule CymphonyElixir.Orchestrator do
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        state
+
+        if is_integer(attempt) do
+          schedule_issue_retry(state, issue.id, attempt + 1, %{
+            identifier: issue.identifier,
+            error: "no SSH worker slots available"
+          })
+        else
+          state
+        end
 
       worker_host ->
         spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, opts)
@@ -1192,7 +1220,10 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp release_held_retry({issue_id, retry_entry}), do: {issue_id, retry_entry}
 
-  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
+  # Keep the entry until dispatch has either started a run, rescheduled, or
+  # explicitly released the claim. Removing it here orphaned a claimed issue
+  # when the final per-ID tracker refresh failed or found a stale issue.
+  defp fetch_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
         metadata = %{
@@ -1203,7 +1234,7 @@ defmodule CymphonyElixir.Orchestrator do
           failures: Map.get(retry_entry, :failures, 0)
         }
 
-        {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
+        {:ok, attempt, metadata, state}
 
       _ ->
         :missing
@@ -1238,7 +1269,7 @@ defmodule CymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host], state_config(state))
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, release_retry_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, active_state_set(state), terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1246,13 +1277,13 @@ defmodule CymphonyElixir.Orchestrator do
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
 
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, release_retry_claim(state, issue_id)}
     end
   end
 
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
-    {:noreply, release_issue_claim(state, issue_id)}
+    {:noreply, release_retry_claim(state, issue_id)}
   end
 
   defp cleanup_issue_workspace(identifier, worker_host, config) when is_binary(identifier) do
@@ -1354,6 +1385,11 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+  end
+
+  defp release_retry_claim(%State{} = state, issue_id) do
+    state = release_issue_claim(state, issue_id)
+    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
   end
 
   defp running_entry_failure_count(running_entry) do
@@ -1856,12 +1892,6 @@ defmodule CymphonyElixir.Orchestrator do
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
           failures: Map.get(retry_entry, :failures, 0)
-        }
-
-        state = %{
-          state
-          | retry_attempts: Map.delete(state.retry_attempts, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id)
         }
 
         {:noreply, new_state} = handle_retry_issue(state, issue_id, attempt, metadata)
