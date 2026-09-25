@@ -82,6 +82,62 @@ defmodule CymphonyElixir.ProjectContextHardeningTest do
     end
   end
 
+  test "remote deletion refuses an issue symlink to another workspace under the same root" do
+    base = Path.join(System.tmp_dir!(), "cymphony-remote-alias-#{System.unique_integer([:positive])}")
+    root = Path.join(base, "workspaces")
+    target = Path.join(root, "CTX-OTHER")
+    alias_path = Path.join(root, "CTX-ALIAS")
+    fake_ssh = Path.join(base, "ssh")
+    old_path = System.get_env("PATH")
+    File.mkdir_p!(target)
+    File.write!(Path.join(target, "sentinel"), "untouched")
+    File.ln_s!(target, alias_path)
+    File.write!(fake_ssh, "#!/bin/sh\nfor arg do command=$arg; done\nexec sh -c \"$command\"\n")
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", base <> ":" <> (old_path || ""))
+    default = Config.settings!()
+    config = %{default | workspace: %{default.workspace | root: root}}
+
+    try do
+      assert {:error, _, _} = Workspace.remove(alias_path, "worker.example", config: config)
+      assert {:error, _, _} = Workspace.remove(alias_path <> "/", "worker.example", config: config)
+      assert {:error, _} = Runner.start_session(alias_path <> "/.", worker_host: "worker.example", config: config)
+      assert File.read!(Path.join(target, "sentinel")) == "untouched"
+    after
+      restore_env("PATH", old_path)
+      File.rm_rf(base)
+    end
+  end
+
+  test "remote relative workspace root preserves login-directory semantics" do
+    base = Path.join(System.tmp_dir!(), "cymphony-remote-relative-#{System.unique_integer([:positive])}")
+    login_dir = Path.join(base, "login")
+    fake_ssh = Path.join(base, "ssh")
+    old_path = System.get_env("PATH")
+    File.mkdir_p!(login_dir)
+    File.write!(fake_ssh, "#!/bin/sh\ncd '#{login_dir}' || exit 1\nfor arg do command=$arg; done\nexec sh -c \"$command\"\n")
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", base <> ":" <> (old_path || ""))
+    default = Config.settings!()
+    config = %{default | workspace: %{default.workspace | root: "./workspaces"}}
+
+    try do
+      assert {:ok, workspace} = Workspace.create_for_issue("CTX-REL", "worker.example", config: config)
+      assert File.dir?(workspace)
+      assert Path.basename(workspace) == "CTX-REL"
+      assert {:ok, []} = Workspace.remove(workspace, "worker.example", config: config)
+      refute File.exists?(workspace)
+
+      parent_config = %{default | workspace: %{default.workspace | root: "../workspaces"}}
+      assert {:ok, parent_workspace} = Workspace.create_for_issue("CTX-PARENT", "worker.example", config: parent_config)
+      assert File.dir?(Path.join(base, "workspaces/CTX-PARENT"))
+      assert File.dir?(parent_workspace)
+    after
+      restore_env("PATH", old_path)
+      File.rm_rf(base)
+    end
+  end
+
   test "Linear assignee me resolves viewer using the current project's API key" do
     parent = self()
 
@@ -127,12 +183,12 @@ defmodule CymphonyElixir.ProjectContextHardeningTest do
     base = Path.join(System.tmp_dir!(), "cymphony-remote-launch-#{System.unique_integer([:positive])}")
     root = Path.join(base, "workspaces")
     workspace = Path.join(root, "CTX-4")
-    outside = Path.join(base, "outside")
+    sibling = Path.join(root, "CTX-OTHER")
     fake_agent = Path.join(base, "claude")
     fake_ssh = Path.join(base, "ssh")
     old_path = System.get_env("PATH")
     File.mkdir_p!(workspace)
-    File.mkdir_p!(outside)
+    File.mkdir_p!(sibling)
     File.write!(fake_ssh, "#!/bin/sh\nfor arg do command=$arg; done\nexec sh -c \"$command\"\n")
     File.write!(fake_agent, "#!/bin/sh\npwd > #{Path.join(base, "launched")}\necho '{\"result\":\"done\"}'\n")
     File.chmod!(fake_ssh, 0o755)
@@ -143,7 +199,7 @@ defmodule CymphonyElixir.ProjectContextHardeningTest do
     try do
       assert {:ok, session} = Runner.start_session(workspace, worker_host: "worker.example")
       File.rm_rf!(workspace)
-      File.ln_s!(outside, workspace)
+      File.ln_s!(sibling, workspace)
       issue = %Issue{id: "ctx-4", identifier: "CTX-4", title: "guard", state: "In Progress"}
       assert {:error, _} = Runner.run_turn(session, "guard", issue)
       refute File.exists?(Path.join(base, "launched"))

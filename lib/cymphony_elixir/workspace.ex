@@ -582,8 +582,9 @@ defmodule CymphonyElixir.Workspace do
   # Resolve on the worker itself: local Path.expand/realpath would inspect the
   # controller's filesystem and could miss a worker-only symlink escape.
   # Paths beneath a not-yet-created root are resolved from the nearest existing
-  # ancestor; existing symlinks are followed by cd -P. Refuse dot-dot rather
-  # than trying to normalize an absent segment across symlink boundaries.
+  # ancestor; existing symlinks are followed by cd -P. A configured relative
+  # root may itself contain dot segments, but traversal appended after that
+  # root is refused rather than normalized across missing components.
   @doc false
   @spec remote_guard_script(Path.t(), term(), boolean()) :: String.t()
   def remote_guard_script(workspace, config, require_existing \\ false) do
@@ -594,9 +595,19 @@ defmodule CymphonyElixir.Workspace do
       ~S'''
       case "$workspace" in /*) ;; *) workspace="$PWD/$workspace" ;; esac
       case "$root" in /*) ;; *) root="$PWD/$root" ;; esac
-      for path in "$workspace" "$root"; do
-        case "/$path/" in *"/../"*|*"/./"*) exit 74 ;; esac
+      while [ "$root" != / ] && [ "${root%/}" != "$root" ]; do
+        root=${root%/}
       done
+      case "$workspace" in
+        "$root"/*) child=${workspace#"$root"/} ;;
+        *) child=$workspace ;;
+      esac
+      case "/$child/" in *"/../"*) exit 74 ;; esac
+      while [ "$workspace" != / ] && [ "${workspace%/}" != "$workspace" ]; do
+        workspace=${workspace%/}
+      done
+      case "${workspace##*/}" in ''|.|..) exit 74 ;; esac
+      [ ! -L "$workspace" ] || exit 74
       canonical_dir_or_missing() {
         path=$1
         suffix=
