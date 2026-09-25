@@ -57,8 +57,9 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
   # The sections whose rendering reads `:now`: the global runtime tile
   # (`@token_totals` + `@running`), the stall banner (`@running`) and the
-  # per-project comprehension (`@projects`, for session runtime and retry
-  # due-in). Keep this in step with the `@now` reads in `render/1` — a clock
+  # per-project session runtime and retry due-in. Only a project's running /
+  # retrying fields carry clocks; a queue-only update must not re-anchor them.
+  # Keep this in step with the `@now` reads in `render/1` — a clock
   # hung off a section that is not listed here would render a stale amount.
   @clock_sections [:token_totals, :running, :projects]
 
@@ -751,7 +752,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
               <span class="rail-vitals-word">queued</span>
             </p>
             <p class="rail-vitals-copy">
-              <%= case autonomy_state(@projects, @polling) do %>
+              <%= case @fleet_controls.autonomy do %>
                 <% :unknown -> %>
                   Checking status…
                 <% :paused -> %>
@@ -772,11 +773,11 @@ defmodule CymphonyElixirWeb.DashboardLive do
             <span class="rail-led rail-led--idle" aria-hidden="true"></span>
             <span class="rail-link-name">Overview</span>
           </a>
-          <%= for project <- @projects do %>
+          <%= for project <- @project_views do %>
             <a class="rail-link" href={"#project-" <> project_dom_id(project.name)} title={project.name}>
-              <span class={"rail-led rail-led--" <> rail_state(project)} aria-hidden="true"></span>
+              <span class={"rail-led rail-led--" <> project.rail_state} aria-hidden="true"></span>
               <span class="rail-link-name"><%= project.name %></span>
-              <span class="rail-link-meta numeric advanced-only"><%= Map.get(project, :running_count, length(project.running)) %>·<%= project_waiting_count(project) %></span>
+              <span class="rail-link-meta numeric advanced-only"><%= project.running_count %>·<%= project.waiting_count %></span>
             </a>
           <% end %>
           <%= if @completions != [] do %>
@@ -832,7 +833,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
               <summary class="jump-menu-summary">Jump to</summary>
               <nav class="jump-menu-panel" aria-label="Jump to section">
                 <a class="jump-menu-link" href="#dashboard-top">Overview</a>
-                <%= for project <- @projects do %>
+                <%= for project <- @project_views do %>
                   <a class="jump-menu-link" href={"#project-" <> project_dom_id(project.name)}><%= project.name %></a>
                 <% end %>
                 <%= if @completions != [] do %>
@@ -887,7 +888,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
           <%= unless @payload_error do %>
             <div class="command-bar-row simple-mode-summary simple-only" aria-live="polite">
-              <%= case autonomy_state(@projects, @polling) do %>
+              <%= case @fleet_controls.autonomy do %>
                 <% :unknown -> %>
                   <span class="autonomy-indicator autonomy-indicator--unknown">
                     <span class="autonomy-indicator-dot" aria-hidden="true"></span>
@@ -999,7 +1000,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                 <span class="metric-pill-label simple-only">Automation</span>
                 <span class="metric-pill-label advanced-only">Polling</span>
                 <span class="metric-pill-value simple-only">
-                  <%= case autonomy_state(@projects, @polling) do %>
+                  <%= case @fleet_controls.autonomy do %>
                     <% :unknown -> %>
                       unavailable
                     <% :paused -> %>
@@ -1085,28 +1086,28 @@ defmodule CymphonyElixirWeb.DashboardLive do
           <%!-- `:key` makes LiveView diff per project rather than resending the
           whole comprehension when one project's numbers move. --%>
           <article
-            :for={project <- @projects}
+            :for={project <- @project_views}
             :key={project.name}
-            class={project_section_class(project, @queue_edit_ids)}
+            class={project_section_class(project.paused, project.name, @queue_edit_ids)}
             id={"project-" <> project_dom_id(project.name)}
           >
             <header class="project-section-header">
               <div class="project-section-title-block">
                 <h2 class="project-section-name">
                   <%= project.name %>
-                  <%= if Map.get(project, :paused, false) do %>
+                  <%= if project.paused do %>
                     <span class="chip chip--warn">Paused</span>
                   <% end %>
                 </h2>
                 <p class="project-section-counts">
-                  <span class="numeric"><%= Map.get(project, :running_count, length(project.running)) %></span>
-                  <%= if max = Map.get(project, :max_concurrent_agents) do %>
+                  <span class="numeric"><%= project.running_count %></span>
+                  <%= if max = project.max_concurrent_agents do %>
                     <span class="muted">/<%= max %></span>
                   <% end %>
                   <span class="muted">running</span>
-                  · <span class="numeric"><%= project_waiting_count(project) %></span>
+                  · <span class="numeric"><%= project.waiting_count %></span>
                   <span class="muted">queued</span>
-                  · <span class="numeric"><%= Map.get(project, :retrying_count, length(project.retrying)) %></span>
+                  · <span class="numeric"><%= project.retrying_count %></span>
                   <span class="muted">retrying</span>
                 </p>
               </div>
@@ -1128,7 +1129,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                     type="number"
                     name="value"
                     min="1"
-                    value={field_value(@field_drafts, "concurrency:#{project.name}", Map.get(project, :max_concurrent_agents) || "")}
+                    value={field_value(@field_drafts, "concurrency:#{project.name}", project.max_concurrent_agents || "")}
                     phx-debounce="400"
                     class="inline-input inline-input--narrow"
                     title="Max concurrent agents (cli alias: cr)"
@@ -1138,12 +1139,12 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
                 <.project_agent_controls
                   project_name={project.name}
-                  settings={project_agent_settings(@agent_setting_drafts, project)}
+                  settings={Map.get(@agent_setting_drafts, project.name, project.agent_settings)}
                   providers_value={
                     field_value(
                       @field_drafts,
                       "providers:#{project.name}",
-                      Enum.join(Map.get(project, :providers, []), ",")
+                      Enum.join(project.providers, ",")
                     )
                   }
                 />
@@ -1154,13 +1155,13 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   phx-click="toggle_project_pause"
                   phx-value-project={project.name}
                 >
-                  <%= if Map.get(project, :paused, false), do: "Resume", else: "Pause" %>
+                  <%= if project.paused, do: "Resume", else: "Pause" %>
                 </button>
               </div>
             </header>
 
-            <%= if project.running == [] and project.retrying == [] and project_waiting(project) == [] do %>
-              <%= if Map.get(project, :paused, false) do %>
+            <%= if project.running == [] and project.retrying == [] and project.waiting == [] do %>
+              <%= if project.paused do %>
                 <p class="empty-state simple-only">
                   This project is paused. Resume it when you want Cymphony to start ready issues again.
                 </p>
@@ -1172,12 +1173,12 @@ defmodule CymphonyElixirWeb.DashboardLive do
               <p class="empty-state advanced-only">No active sessions.</p>
             <% end %>
 
-            <%= if project_waiting(project) != [] do %>
+            <%= if project.waiting != [] do %>
               <section class="queue-board section--board">
                 <header class="queue-board-header">
                   <span class="queue-board-label simple-only">Up next</span>
                   <span class="queue-board-label advanced-only">Queue</span>
-                  <span class="queue-board-count numeric"><%= project_waiting_count(project) %></span>
+                  <span class="queue-board-count numeric"><%= project.waiting_count %></span>
                   <span class="queue-board-hint">Leftmost starts next</span>
                 </header>
                 <div
@@ -1185,15 +1186,16 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   class="queue-board-list"
                   phx-hook="QueueBoard"
                   data-project={project.name}
-                  data-order={queue_order_attr(project_waiting(project))}
+                  data-order={project.queue_order}
                 >
                   <.queue_card
-                    :for={{entry, rank} <- Enum.with_index(project_waiting(project))}
+                    :for={card <- project.queue_cards}
+                    :key={card.entry.issue_identifier}
                     project_name={project.name}
-                    entry={entry}
-                    rank={rank}
-                    editing?={MapSet.member?(@queue_edit_ids, {project.name, entry.issue_identifier})}
-                    spec={queue_run_spec_settings(@queue_run_spec_drafts, project, entry)}
+                    entry={card.entry}
+                    rank={card.rank}
+                    editing?={MapSet.member?(@queue_edit_ids, {project.name, card.entry.issue_identifier})}
+                    spec={queue_card_spec(@queue_run_spec_drafts, project.name, card.entry.issue_identifier, card.spec, card.entry.agent_kind)}
                   />
                 </div>
               </section>
@@ -1443,7 +1445,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
           <%= if @polling do %>
             <div class="settings-control-row">
-              <%= if autonomy_state(@projects, @polling) == :paused do %>
+              <%= if @fleet_controls.autonomy == :paused do %>
                 <button type="button" class="subtle-button subtle-button--accent settings-submit" phx-click="resume_dispatch">Resume all</button>
               <% else %>
                 <button type="button" class="subtle-button settings-submit" phx-click="pause_dispatch">Pause all</button>
@@ -1469,8 +1471,8 @@ defmodule CymphonyElixirWeb.DashboardLive do
                 type="number"
                 name="value"
                 min="1"
-                value={field_value(@field_drafts, "global-concurrency", fleet_concurrency(@projects) || "")}
-                placeholder={fleet_concurrency_placeholder(@projects)}
+                value={field_value(@field_drafts, "global-concurrency", @fleet_controls.concurrency || "")}
+                placeholder={@fleet_controls.placeholder}
                 phx-debounce="400"
                 class="settings-field"
               />
@@ -1717,14 +1719,19 @@ defmodule CymphonyElixirWeb.DashboardLive do
         assign_changed_section(acc, assign_key, payload_section(payload, payload_key))
       end)
 
-    maybe_reanchor_clocks(updated, socket)
+    updated
+    |> assign(:project_views, project_views(updated.assigns.projects, Map.get(socket.assigns, :project_views, [])))
+    |> assign(:fleet_controls, %{
+      autonomy: autonomy_state(updated.assigns.projects, updated.assigns.polling),
+      concurrency: fleet_concurrency(updated.assigns.projects),
+      placeholder: fleet_concurrency_placeholder(updated.assigns.projects)
+    })
+    |> maybe_reanchor_clocks(socket)
   end
 
   # `:now` is the anchor every server-rendered clock is derived from, and it is
-  # read inside the per-project comprehension. A HEEx comprehension is a single
-  # change-tracked slot: touching `:now` re-evaluates and re-serializes every
-  # project header, queue card, session row and restart form, which is exactly
-  # the work the section split exists to skip. So `:now` moves only when a
+  # read by clock-bearing rows. Even with keyed rows, touching `:now` would
+  # serialize unrelated clocks during a queue-only update. It moves only when a
   # section a clock actually reads moved — never on a load that changed nothing
   # (or that only moved the poll countdown, which carries its own remaining-ms
   # anchor and needs no wall clock).
@@ -1735,7 +1742,53 @@ defmodule CymphonyElixirWeb.DashboardLive do
   end
 
   defp section_moved?(previous, socket, key) do
-    Map.get(previous.assigns, key, :__absent__) != Map.fetch!(socket.assigns, key)
+    clock_section(key, Map.get(previous.assigns, key, :__absent__)) !=
+      clock_section(key, Map.fetch!(socket.assigns, key))
+  end
+
+  defp clock_section(:projects, projects) when is_list(projects),
+    do: Enum.map(projects, &entry_signature(Map.take(&1, [:name, :running, :retrying])))
+
+  defp clock_section(_key, section), do: section
+
+  # Keep payloads/API data untouched. These derived render fields let HEEx
+  # compare the actual dependency instead of marking every control dirty when
+  # any field in its project changes (for example, one waiting issue's title).
+  defp project_views(projects, previous) do
+    previous = Map.new(previous, &{&1.name, &1})
+    Enum.map(projects, &project_view(&1, Map.get(previous, &1.name, %{})))
+  end
+
+  defp project_view(project, previous) do
+    waiting = project_waiting(project)
+
+    Map.merge(project, %{
+      running: stable_render_section(Map.get(previous, :running), project.running),
+      retrying: stable_render_section(Map.get(previous, :retrying), project.retrying),
+      paused: Map.get(project, :paused, false),
+      running_count: Map.get(project, :running_count, length(project.running)),
+      retrying_count: Map.get(project, :retrying_count, length(project.retrying)),
+      waiting_count: project_waiting_count(project),
+      max_concurrent_agents: Map.get(project, :max_concurrent_agents),
+      providers: Map.get(project, :providers, []),
+      agent_settings: project_agent_settings(%{}, project),
+      rail_state: rail_state(project),
+      waiting: waiting,
+      queue_order: queue_order_attr(waiting),
+      queue_cards:
+        waiting
+        |> Enum.with_index()
+        |> Enum.map(fn {entry, rank} ->
+          %{entry: entry, rank: rank, spec: inherited_queue_run_spec(project, entry)}
+        end)
+    })
+  end
+
+  # A title-only queue update can arrive alongside heartbeat/rate/deadline
+  # drift. Reuse the existing section signature so that drift does not repaint
+  # unrelated session/retry controls merely because their parent project moved.
+  defp stable_render_section(previous, current) do
+    if section_signature(previous) == section_signature(current), do: previous, else: current
   end
 
   defp assign_changed_section(socket, key, value) do
@@ -2067,9 +2120,10 @@ defmodule CymphonyElixirWeb.DashboardLive do
     >
       <div class="queue-card-body">
         <div class="queue-card-id">
-          <%= if @rank == 0 do %>
-            <span class="queue-next-badge" title="Starts when a slot opens">Next</span>
-          <% end %>
+          <%!-- Keep this static shape when a keyed card moves into/out of first
+          place. A conditional subtree here loses its shared static reference
+          on reorder in LiveView 1.1.33 (Diff.template_static/2). --%>
+          <span class="queue-next-badge" title="Starts when a slot opens" style={if @rank != 0, do: "display: none"}>Next</span>
           <%= if @entry.issue_url do %>
             <a href={@entry.issue_url} target="_blank" rel="noopener" class="session-row-link queue-card-link"><%= @entry.issue_identifier %></a>
           <% else %>
@@ -2764,9 +2818,8 @@ defmodule CymphonyElixirWeb.DashboardLive do
     end
   end
 
-  defp project_section_class(project, queue_edit_ids) do
-    paused? = Map.get(project, :paused, false)
-    edit_open? = queue_edit_open?(queue_edit_ids, Map.get(project, :name))
+  defp project_section_class(paused?, project_name, queue_edit_ids) do
+    edit_open? = queue_edit_open?(queue_edit_ids, project_name)
 
     ["project-section", paused? && "project-section--paused", edit_open? && "is-queue-edit-open"]
     |> Enum.filter(& &1)
@@ -2812,9 +2865,11 @@ defmodule CymphonyElixirWeb.DashboardLive do
   end
 
   defp queue_run_spec_settings(drafts, project, entry) when is_map(project) do
-    inherited = inherited_queue_run_spec(project, entry)
+    queue_card_spec(drafts, project.name, entry.issue_identifier, inherited_queue_run_spec(project, entry), Map.get(entry, :agent_kind))
+  end
 
-    case Map.get(drafts, {Map.get(project, :name), entry.issue_identifier}) do
+  defp queue_card_spec(drafts, project_name, identifier, inherited, entry_kind) do
+    case Map.get(drafts, {project_name, identifier}) do
       nil ->
         inherited
 
@@ -2825,7 +2880,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
           kind: kind,
           model: Map.get(draft, :model, inherited.model),
           effort: Map.get(draft, :effort, inherited.effort),
-          suggestion_kind: suggestion_kind(kind, entry)
+          suggestion_kind: suggestion_kind(kind, %{agent_kind: entry_kind})
         }
     end
   end

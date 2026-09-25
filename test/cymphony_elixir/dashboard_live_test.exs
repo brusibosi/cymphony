@@ -481,9 +481,11 @@ defmodule CymphonyElixir.DashboardLiveTest do
     workflow_path = Path.join(workflow_dir, "WORKFLOW.md")
     File.write!(workflow_path, WorkflowGenerator.generate(project))
 
+    store_opts = [name: ProjectSupervisor.via_tuple("default", :workflow_store), workflow_path: workflow_path]
+
     start_supervised!(%{
       id: {:dashboard_failed_rewrite_store, "default"},
-      start: {WorkflowStore, :start_link, [[name: ProjectSupervisor.via_tuple("default", :workflow_store), workflow_path: workflow_path]]}
+      start: {WorkflowStore, :start_link, [store_opts]}
     })
 
     owner = self()
@@ -2166,6 +2168,182 @@ defmodule CymphonyElixir.DashboardLiveTest do
     :erlang.trace(view.pid, false, [:send])
   end
 
+  @tag queue_diff: true
+  test "a queue title update does not repaint session controls or clocks for concurrent volatile drift" do
+    start_dashboard(snapshot: Map.put(static_snapshot(), :waiting, [waiting_snapshot_entry(%{identifier: "DIFF-1"})]))
+    {:ok, view, _html} = live(build_conn(), "/")
+    view |> form(~s|form[phx-submit="set_refresh_interval"]|, %{value: "600"}) |> render_submit()
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
+    render(view)
+
+    view
+    |> element(~s|button[phx-click="toggle_logs"][phx-value-issue="MT-HTTP"]|)
+    |> render_click()
+
+    payload = view_payload(view)
+    now_before = view_assigns(view).now
+    [running] = payload.running
+    [retrying] = payload.retrying
+    running = Map.merge(running, %{last_event_at: "2026-09-25T00:00:00Z", tokens_per_second: 987.0})
+    retrying = Map.put(retrying, :due_at, "2026-09-25T00:00:01Z")
+
+    projects =
+      payload.projects
+      |> patch_waiting_title("DIFF-1", "Only this title changed")
+      |> patch_running(running)
+      |> Enum.map(&%{&1 | retrying: [retrying]})
+
+    drifted = %{
+      payload
+      | projects: projects,
+        running: [running],
+        retrying: [retrying],
+        polling: %{payload.polling | next_poll_in_ms: 3_137}
+    }
+
+    :erlang.trace(view.pid, true, [:send])
+
+    diff =
+      capture_diff_text(view, fn ->
+        send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, drifted))
+      end)
+
+    assert diff =~ "Only this title changed"
+    refute diff =~ "spec-switcher"
+    refute diff =~ "data-base-seconds"
+    refute diff =~ "data-remaining-ms"
+    refute diff =~ "session-row"
+    assert byte_size(diff) < 512
+    assert view_assigns(view).now == now_before
+    assert has_element?(view, "#queue-card-default-DIFF-1 .queue-card-title", "Only this title changed")
+    :erlang.trace(view.pid, false, [:send])
+
+    # A real retry update still lands, including its fresh clock anchor.
+    retrying = %{retrying | attempt: 3}
+    projects = Enum.map(projects, &%{&1 | retrying: [retrying]})
+    changed = %{drifted | projects: projects, retrying: [retrying]}
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, changed))
+    render(view)
+    assert DateTime.compare(view_assigns(view).now, now_before) == :gt
+    assert has_element?(view, ".retry-row .chip--warn", "Attempt 3")
+  end
+
+  for queue_size <- [3, 100] do
+    @tag queue_diff: true
+    test "a #{queue_size}-card queue patches one title and preserves its keyed editor on reorder" do
+      waiting =
+        for rank <- 1..unquote(queue_size) do
+          waiting_snapshot_entry(%{
+            identifier: "DIFF-#{rank}",
+            title: "Unchanged queue title #{rank}",
+            agent_kind: "codex",
+            model: "gpt-5.2-codex",
+            effort: "high"
+          })
+        end
+
+      start_dashboard(snapshot: Map.put(static_snapshot(), :waiting, waiting))
+      {:ok, view, _html} = live(build_conn(), "/")
+      view |> form(~s|form[phx-submit="set_refresh_interval"]|, %{value: "600"}) |> render_submit()
+      send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
+      render(view)
+
+      view
+      |> element(~s|button.queue-card-edit-toggle[phx-value-issue="DIFF-2"]|)
+      |> render_click()
+
+      render_change(view, "preview_queue_run_spec", %{
+        "project" => "default",
+        "issue" => "DIFF-2",
+        "agent_kind" => "codex",
+        "model" => "unsaved-model",
+        "effort" => "low"
+      })
+
+      editor = "#queue-edit-default-DIFF-2"
+      editor_before = view |> element(editor) |> render()
+      draft_before = view_assigns(view).queue_run_spec_drafts
+      assert has_element?(view, ~s|#{editor} #queue-model-DIFF-2[value="unsaved-model"]|)
+      assert has_element?(view, ~s|#{editor} #spec-switcher-queue-agent-DIFF-2[phx-hook="SpecSwitcher"]|)
+
+      :erlang.trace(view.pid, true, [:send])
+
+      # Cover both a sibling card changing and the card owning the open editor.
+      # Queue size must not affect the patch: serializing unchanged rows or the
+      # editor would reset client-owned switcher state during observation loads.
+      for identifier <- ["DIFF-1", "DIFF-2"] do
+        title = "Changed title #{identifier}"
+
+        diff =
+          capture_diff_text(view, fn ->
+            payload = view_payload(view)
+
+            projects = patch_waiting_title(payload.projects, identifier, title)
+
+            send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: projects}))
+          end)
+
+        assert diff =~ title
+        refute diff =~ "Unchanged queue title"
+        refute diff =~ "queue-card"
+        refute diff =~ "queue-edit"
+        refute diff =~ "spec-switcher"
+        refute diff =~ "combobox"
+        refute diff =~ "unsaved-model"
+        refute diff =~ "session-row"
+        assert byte_size(diff) < 512
+
+        assert has_element?(view, "#queue-card-default-#{identifier} .queue-card-title", title)
+        assert view |> element(editor) |> render() == editor_before
+        assert view_assigns(view).queue_run_spec_drafts == draft_before
+        assert view_assigns(view).queue_edit_ids == MapSet.new([{"default", "DIFF-2"}])
+      end
+
+      # Move the edited card into the Next position. Stable keys must move its
+      # existing edit subtree, not serialize a replacement switcher or lose the
+      # unsaved draft. This also exercises the rank badge's template boundary.
+      reordered =
+        capture_diff_text(view, fn ->
+          payload = view_payload(view)
+
+          projects =
+            Enum.map(payload.projects, fn project ->
+              [first | rest] = project.waiting
+              %{project | waiting: rest ++ [first]}
+            end)
+
+          send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: projects}))
+        end)
+
+      refute reordered =~ "Unchanged queue title"
+      refute reordered =~ "Changed title"
+      refute reordered =~ "spec-switcher"
+      refute reordered =~ "unsaved-model"
+      assert view |> element(editor) |> render() == editor_before
+      assert view_assigns(view).queue_run_spec_drafts == draft_before
+      assert view_assigns(view).queue_edit_ids == MapSet.new([{"default", "DIFF-2"}])
+      assert has_element?(view, ~s|#queue-card-default-DIFF-2[data-rank="0"] .queue-next-badge|)
+      refute has_element?(view, ~s|#queue-card-default-DIFF-2 .queue-next-badge[style*="display: none"]|)
+      assert has_element?(view, ~s|#queue-card-default-DIFF-1 .queue-next-badge[style="display: none"]|)
+
+      order =
+        view
+        |> element("#queue-board-default")
+        |> render()
+        |> Floki.parse_fragment!()
+        |> Floki.find(".queue-card")
+        |> Floki.attribute("data-issue")
+
+      assert order == Enum.map(2..unquote(queue_size), &"DIFF-#{&1}") ++ ["DIFF-1"]
+
+      assert measure_diff_bytes(view, fn ->
+               send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
+             end) == 0
+
+      :erlang.trace(view.pid, false, [:send])
+    end
+  end
+
   # Assign keys whose value moved between two snapshots of the socket. LiveView
   # only re-evaluates (and only ships a diff for) assigns it marked as changed,
   # so an empty list is the server-side proxy for "no websocket traffic".
@@ -2381,7 +2559,8 @@ defmodule CymphonyElixir.DashboardLiveTest do
   # right, the wire was not. Requires `:erlang.trace(view.pid, true, [:send])`.
   defp measure_diff_bytes(view, fun), do: byte_size(capture_diff_text(view, fun))
 
-  # The diff itself, so a test can assert on *what* was resent and not only on
+  # JSON-encoded diff bytes (never inspect/1, which truncates large payloads),
+  # so a test can assert on *what* was resent and not only on
   # how much. `byte_size(a) + byte_size(b) == byte_size(a <> b)`, so this is the
   # same number `measure_diff_bytes/2` always reported.
   defp capture_diff_text(view, fun) do
@@ -2394,7 +2573,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
   defp drain_diff_text(acc) do
     receive do
       {:trace, _pid, :send, %Phoenix.Socket.Message{event: "diff", payload: payload}, _to} ->
-        drain_diff_text(acc <> inspect(payload))
+        drain_diff_text(acc <> Jason.encode!(payload))
 
       {:trace, _pid, :send, _msg, _to} ->
         drain_diff_text(acc)
@@ -2454,6 +2633,18 @@ defmodule CymphonyElixir.DashboardLiveTest do
       projects: assigns.projects,
       recent_completed: assigns.completions
     }
+  end
+
+  defp patch_waiting_title(projects, identifier, title) do
+    Enum.map(projects, fn project ->
+      %{project | waiting: patch_waiting_entries(project.waiting, identifier, title)}
+    end)
+  end
+
+  defp patch_waiting_entries(waiting, identifier, title) do
+    Enum.map(waiting, fn entry ->
+      if entry.issue_identifier == identifier, do: %{entry | issue_title: title}, else: entry
+    end)
   end
 
   defp patch_running(projects, entry) do
