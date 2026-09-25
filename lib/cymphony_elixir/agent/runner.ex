@@ -11,7 +11,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   require Logger
 
-  alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text}
+  alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text, Workspace}
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
@@ -246,7 +246,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp remote_launch_command(workspace, command, run_spec, agent_module, config)
        when is_binary(workspace) do
-    (["cd #{shell_escape(workspace)}"] ++
+    ([Workspace.remote_guard_script(workspace, config, true), "cd \"$workspace\""] ++
        remote_env_exports(run_spec, agent_module, config) ++ ["exec #{command}"])
     |> Enum.join(" && ")
   end
@@ -523,7 +523,7 @@ defmodule CymphonyElixir.Agent.Runner do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host, _config)
+  defp validate_workspace_cwd(workspace, worker_host, config)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
@@ -533,7 +533,10 @@ defmodule CymphonyElixir.Agent.Runner do
         {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
 
       true ->
-        {:ok, workspace}
+        case Workspace.validate_remote_workspace(workspace, worker_host, config, true) do
+          :ok -> {:ok, workspace}
+          {:error, reason} -> {:error, {:invalid_workspace_cwd, :remote_path, reason}}
+        end
     end
   end
 

@@ -159,15 +159,15 @@ defmodule CymphonyElixirWeb.Presenter do
   defp maybe_issue_payload_from_snapshot(%{} = snapshot, issue_identifier) do
     running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
     retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
-    issue_payload_from_entries(issue_identifier, running, retry)
+    issue_payload_from_entries(issue_identifier, running, retry, snapshot)
   end
 
   defp maybe_issue_payload_from_snapshot(_snapshot, _issue_identifier), do: nil
 
-  defp issue_payload_from_entries(_issue_identifier, nil, nil), do: nil
+  defp issue_payload_from_entries(_issue_identifier, nil, nil, _snapshot), do: nil
 
-  defp issue_payload_from_entries(issue_identifier, running, retry) do
-    {:ok, issue_payload_body(issue_identifier, running, retry)}
+  defp issue_payload_from_entries(issue_identifier, running, retry, snapshot) do
+    {:ok, issue_payload_body(issue_identifier, running, retry, snapshot)}
   end
 
   @spec refresh_payload(GenServer.name()) :: {:ok, map()} | {:error, :unavailable}
@@ -265,13 +265,13 @@ defmodule CymphonyElixirWeb.Presenter do
 
   defp map_value(_map, _keys), do: nil
 
-  defp issue_payload_body(issue_identifier, running, retry) do
+  defp issue_payload_body(issue_identifier, running, retry, snapshot) do
     %{
       issue_identifier: issue_identifier,
       issue_id: issue_id_from_entries(running, retry),
       status: issue_status(running, retry),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry),
+        path: workspace_path(issue_identifier, running, retry, snapshot),
         host: workspace_host(running, retry)
       },
       attempts: %{
@@ -300,7 +300,7 @@ defmodule CymphonyElixirWeb.Presenter do
   defp issue_status(nil, _retry), do: "retrying"
   defp issue_status(_running, _retry), do: "running"
 
-  defp running_entry_payload(entry) do
+  defp running_entry_payload(entry, stall_timeout_ms) do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
@@ -320,7 +320,7 @@ defmodule CymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_agent_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_agent_timestamp),
-      stalled: stalled?(entry.last_agent_timestamp),
+      stalled: stalled?(entry.last_agent_timestamp, stall_timeout_ms),
       log_events: Enum.take(Map.get(entry, :log_events, []), 20),
       project_name: Map.get(entry, :project_name),
       tokens: %{
@@ -394,7 +394,7 @@ defmodule CymphonyElixirWeb.Presenter do
     running =
       snapshot.running
       |> Enum.map(&Map.put(&1, :project_name, project_name))
-      |> Enum.map(&running_entry_payload/1)
+      |> Enum.map(&running_entry_payload(&1, Map.get(snapshot, :stall_timeout_ms)))
 
     retrying =
       snapshot.retrying
@@ -462,10 +462,10 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry) do
+  defp workspace_path(issue_identifier, running, retry, snapshot) do
     (running && Map.get(running, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
-      Path.join(Config.settings!().workspace.root, issue_identifier)
+      Path.join(Map.get(snapshot, :workspace_root) || Config.settings!().workspace.root, issue_identifier)
   end
 
   defp workspace_host(running, retry) do
@@ -491,15 +491,15 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  defp stalled?(%DateTime{} = last_event_at) do
-    timeout_ms = Config.settings!().agent.stall_timeout_ms
+  defp stalled?(%DateTime{} = last_event_at, configured_timeout_ms) do
+    timeout_ms = configured_timeout_ms || Config.settings!().agent.stall_timeout_ms
     elapsed_ms = DateTime.diff(DateTime.utc_now(), last_event_at, :millisecond)
-    elapsed_ms > timeout_ms
+    timeout_ms > 0 and elapsed_ms > timeout_ms
   rescue
     _ -> false
   end
 
-  defp stalled?(_), do: false
+  defp stalled?(_, _), do: false
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_agent_message(message)

@@ -507,7 +507,7 @@ defmodule CymphonyElixir.Orchestrator do
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
+          cleanup_issue_workspace(identifier, worker_host, state_config(state))
         end
 
         if is_pid(pid) do
@@ -1237,7 +1237,7 @@ defmodule CymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+        cleanup_issue_workspace(issue.identifier, metadata[:worker_host], state_config(state))
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, active_state_set(state), terminal_states) ->
@@ -1255,13 +1255,11 @@ defmodule CymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
-
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+  defp cleanup_issue_workspace(identifier, worker_host, config) when is_binary(identifier) do
+    Workspace.remove_issue_workspaces(identifier, worker_host, config: config)
   end
 
-  defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+  defp cleanup_issue_workspace(_identifier, _worker_host, _config), do: :ok
 
   defp run_terminal_workspace_cleanup(%State{} = state) do
     config = state_config(state)
@@ -1280,13 +1278,14 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp run_workspace_sweep(%State{} = state) do
-    days = state.config.workspace.retention_days
+    config = state_config(state)
+    days = config.workspace.retention_days
 
     if is_integer(days) do
-      root = state.config.workspace.root
+      root = config.workspace.root
       exclude = running_workspace_paths(state)
 
-      case Workspace.clean_stale(root, days: days, exclude_paths: exclude) do
+      case Workspace.clean_stale(root, days: days, exclude_paths: exclude, config: config) do
         {:ok, []} ->
           :ok
 
@@ -1317,7 +1316,7 @@ defmodule CymphonyElixir.Orchestrator do
         issues
         |> Enum.each(fn
           %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
+            cleanup_issue_workspace(identifier, nil, config)
 
           _ ->
             :ok
@@ -1430,7 +1429,7 @@ defmodule CymphonyElixir.Orchestrator do
 
     post_abandon_comment(state, issue_id, identifier, failures, metadata[:error])
     move_to_failure_state(state, issue_id, identifier)
-    cleanup_issue_workspace(identifier, metadata[:worker_host])
+    cleanup_issue_workspace(identifier, metadata[:worker_host], state_config(state))
 
     %{
       state
@@ -1772,6 +1771,8 @@ defmodule CymphonyElixir.Orchestrator do
     {:reply,
      %{
        project_name: state.project_name,
+       workspace_root: state.config.workspace.root,
+       stall_timeout_ms: state.config.agent.stall_timeout_ms,
        running: running,
        waiting: waiting,
        retrying: retrying,

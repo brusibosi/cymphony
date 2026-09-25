@@ -860,25 +860,25 @@ defmodule CymphonyElixir.Linear.Client do
         {:ok, nil}
 
       assignee ->
-        build_assignee_filter(assignee)
+        build_assignee_filter(assignee, config)
     end
   end
 
-  defp build_assignee_filter(assignee) when is_binary(assignee) do
+  defp build_assignee_filter(assignee, config \\ nil) when is_binary(assignee) do
     case normalize_assignee_match_value(assignee) do
       nil ->
         {:ok, nil}
 
       "me" ->
-        resolve_viewer_assignee_filter()
+        resolve_viewer_assignee_filter(config)
 
       normalized ->
         {:ok, %{configured_assignee: assignee, match_values: MapSet.new([normalized])}}
     end
   end
 
-  defp resolve_viewer_assignee_filter do
-    case graphql(@viewer_query, %{}) do
+  defp resolve_viewer_assignee_filter(config) do
+    case graphql(@viewer_query, %{}, graphql_opts_for_config(config)) do
       {:ok, %{"data" => %{"viewer" => viewer}}} when is_map(viewer) ->
         case assignee_id(viewer) do
           nil ->
