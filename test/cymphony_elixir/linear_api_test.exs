@@ -6,7 +6,9 @@ defmodule CymphonyElixir.LinearApiTest do
   import Phoenix.ConnTest
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.WorkflowGenerator
   alias CymphonyElixir.ProjectSupervisor
+  alias CymphonyElixir.WorkflowStore
 
   @endpoint CymphonyElixirWeb.Endpoint
   @fake_key "lin_api_fake"
@@ -16,6 +18,7 @@ defmodule CymphonyElixir.LinearApiTest do
     previous_key = System.get_env("LINEAR_API_KEY")
     previous_opts = Application.get_env(:cymphony_elixir, :linear_graphql_opts)
     previous_start_args = Application.get_env(:cymphony_elixir, :start_project_args)
+    previous_workflow_temp_dir = Application.get_env(:cymphony_elixir, :workflow_temp_dir)
     endpoint_config = Application.get_env(:cymphony_elixir, CymphonyElixirWeb.Endpoint, [])
 
     tmp = Path.join(System.tmp_dir!(), "cymphony-linear-api-#{System.unique_integer([:positive])}")
@@ -24,6 +27,7 @@ defmodule CymphonyElixir.LinearApiTest do
     System.delete_env("LINEAR_API_KEY")
     Application.delete_env(:cymphony_elixir, :linear_graphql_opts)
     Application.delete_env(:cymphony_elixir, :start_project_args)
+    Application.delete_env(:cymphony_elixir, :workflow_temp_dir)
 
     Application.put_env(
       :cymphony_elixir,
@@ -38,6 +42,7 @@ defmodule CymphonyElixir.LinearApiTest do
       restore_env("LINEAR_API_KEY", previous_key)
       restore_app_env(:linear_graphql_opts, previous_opts)
       restore_app_env(:start_project_args, previous_start_args)
+      restore_app_env(:workflow_temp_dir, previous_workflow_temp_dir)
       Application.delete_env(:cymphony_elixir, :config_dir_override)
       Application.put_env(:cymphony_elixir, CymphonyElixirWeb.Endpoint, endpoint_config)
       File.rm_rf!(tmp)
@@ -98,6 +103,38 @@ defmodule CymphonyElixir.LinearApiTest do
     refute_raw_key(conn)
     {:ok, cfg} = CymphonyConfig.load()
     assert cfg["linear_api_key"] == @fake_key
+  end
+
+  test "POST /api/v1/linear reports workflow rewrite failure without exposing the key", %{tmp: tmp, path: path} do
+    project = %{"name" => "Farm", "linear_project_slug" => "farm-slug", "linear_api_key" => @test_key}
+    File.write!(path, Jason.encode!(%{"projects" => [project]}))
+    workflow_dir = Path.join(tmp, "workflow")
+    File.mkdir_p!(workflow_dir)
+    workflow_path = Path.join(workflow_dir, "WORKFLOW.md")
+    File.write!(workflow_path, WorkflowGenerator.generate(project))
+
+    start_supervised!(%{
+      id: {:failed_linear_rewrite_store, "Farm"},
+      start: {WorkflowStore, :start_link, [[name: ProjectSupervisor.via_tuple("Farm", :workflow_store), workflow_path: workflow_path]]}
+    })
+
+    owner = self()
+
+    orch =
+      spawn(fn ->
+        {:ok, _} = Registry.register(CymphonyElixir.ProjectRegistry, {"Farm", :orchestrator}, nil)
+        send(owner, :orch_registered)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :orch_registered
+    on_exit(fn -> Process.exit(orch, :kill) end)
+    File.rm_rf!(workflow_dir)
+    stub_linear_viewer()
+
+    conn = post(build_conn(), "/api/v1/linear", %{"api_key" => @fake_key})
+    assert json_response(conn, 422)["error"]["code"] == "linear_workflow_rewrite_failed"
+    refute_raw_key(conn)
   end
 
   test "POST /api/v1/linear returns 422 empty_api_key for a blank key" do
@@ -377,6 +414,15 @@ defmodule CymphonyElixir.LinearApiTest do
                "message" => "Project was saved but failed to start"
              }
            }
+  end
+
+  test "POST /api/v1/projects reports generated workflow failure instead of crashing", %{tmp: tmp, path: path} do
+    File.write!(path, Jason.encode!(%{"linear_api_key" => @test_key, "projects" => []}))
+    Application.put_env(:cymphony_elixir, :workflow_temp_dir, Path.join(tmp, "missing"))
+
+    conn = post(build_conn(), "/api/v1/projects", %{"name" => "Farm", "linear_project_slug" => "farm-slug"})
+    assert json_response(conn, 422)["error"]["code"] == "project_workflow_failed"
+    refute_raw_key(conn)
   end
 
   test "unsupported methods on the new routes return 405" do

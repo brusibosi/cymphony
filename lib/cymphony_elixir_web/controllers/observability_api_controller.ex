@@ -7,6 +7,7 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
 
   alias CymphonyElixir.{Agent, CompletionStore, HarnessStream}
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixirWeb.{Control, Endpoint, Presenter}
   alias Plug.Conn
 
@@ -50,6 +51,9 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
       {:error, {:project_start_failed, _reason}} ->
         error_response(conn, 422, "project_start_failed", "Project was saved but failed to start")
 
+      {:error, {:workflow_write_failed, _reason}} ->
+        error_response(conn, 422, "project_workflow_failed", "Project was saved but its workflow could not be generated")
+
       {:error, _reason} ->
         error_response(conn, 422, "invalid_project", "Could not add project")
     end
@@ -76,6 +80,9 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
 
       {:error, :invalid} ->
         error_response(conn, 422, "invalid_api_key", "Linear rejected that API key")
+
+      {:error, {:workflow_rewrite_failed, _project, _reason}} ->
+        error_response(conn, 422, "linear_workflow_rewrite_failed", "Linear key was saved, but a project workflow could not be updated")
 
       {:error, _reason} ->
         error_response(conn, 422, "linear_error", "Could not reach Linear")
@@ -273,11 +280,19 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
 
     case Control.parse_concurrency(params["value"]) do
       {:ok, n} ->
-        Control.set_concurrency(Control.scope(project), n)
+        case control_scope(project) do
+          {:ok, scope} ->
+            respond_control_change(
+              conn,
+              Control.set_concurrency(scope, n),
+              %{max_concurrent_agents: n, project: project},
+              "concurrency_not_persisted",
+              "Concurrency was applied, but could not be saved to config.json"
+            )
 
-        conn
-        |> put_status(202)
-        |> json(%{max_concurrent_agents: n, project: project})
+          :error ->
+            error_response(conn, 422, "invalid_scope", "project must be a name")
+        end
 
       :error ->
         error_response(
@@ -295,11 +310,19 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
 
     case parse_providers(params["value"]) do
       {:ok, list} ->
-        Control.set_providers(Control.scope(project), list)
+        case control_scope(project) do
+          {:ok, scope} ->
+            respond_control_change(
+              conn,
+              Control.set_providers(scope, list),
+              %{providers: list, project: project},
+              "providers_not_persisted",
+              "Providers were applied, but could not be saved to config.json"
+            )
 
-        conn
-        |> put_status(202)
-        |> json(%{providers: list, project: project})
+          :error ->
+            error_response(conn, 422, "invalid_scope", "project must be a name")
+        end
 
       :error ->
         error_response(
@@ -317,16 +340,24 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
 
     case Control.parse_agent_settings(params) do
       {:ok, settings} ->
-        Control.set_agent_settings(Control.scope(project), settings)
+        case control_scope(project) do
+          {:ok, scope} ->
+            respond_control_change(
+              conn,
+              Control.set_agent_settings(scope, settings),
+              %{
+                agent: settings["agent"],
+                model: settings["model"],
+                effort: settings["effort"],
+                project: project
+              },
+              "agent_settings_not_persisted",
+              "Agent settings were applied, but could not be fully saved"
+            )
 
-        conn
-        |> put_status(202)
-        |> json(%{
-          agent: settings["agent"],
-          model: settings["model"],
-          effort: settings["effort"],
-          project: project
-        })
+          :error ->
+            error_response(conn, 422, "invalid_scope", "project must be a name")
+        end
 
       :error ->
         error_response(
@@ -407,6 +438,23 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
     |> json(%{error: %{code: code, message: message}})
   end
 
+  defp respond_control_change(conn, :ok, payload, _code, _message) do
+    conn |> put_status(202) |> json(payload)
+  end
+
+  defp respond_control_change(conn, {:error, :not_found}, _payload, _code, _message) do
+    error_response(conn, 422, "project_not_found", "No orchestrator is registered for that project")
+  end
+
+  defp respond_control_change(conn, {:error, _reason}, _payload, code, message) do
+    error_response(conn, 422, code, message)
+  end
+
+  defp control_scope(project) when is_binary(project) or is_nil(project),
+    do: {:ok, Control.scope(project)}
+
+  defp control_scope(_project), do: :error
+
   defp linear_api_key_param(params) when is_map(params) do
     case Map.get(params, "api_key") do
       key when is_binary(key) -> key
@@ -452,13 +500,17 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
   defp parse_providers(value) when is_binary(value) do
     case CymphonyConfig.parse_providers_csv(value) do
       {:ok, list} -> {:ok, list}
-      {:error, :empty} -> :error
+      {:error, _reason} -> :error
     end
   end
 
   defp parse_providers(value) when is_list(value) do
-    list = value |> Enum.map(&to_string/1) |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
-    if list == [], do: :error, else: {:ok, list}
+    if Enum.all?(value, &is_binary/1) do
+      list = value |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+      if list != [] and Enum.all?(list, &ShellProvider.valid_name?/1), do: {:ok, list}, else: :error
+    else
+      :error
+    end
   end
 
   defp parse_providers(_), do: :error

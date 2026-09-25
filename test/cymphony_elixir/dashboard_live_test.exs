@@ -16,6 +16,9 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
   alias CymphonyElixir.Agent
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.WorkflowGenerator
+  alias CymphonyElixir.ProjectSupervisor
+  alias CymphonyElixir.WorkflowStore
   alias CymphonyElixirWeb.Presenter
 
   @endpoint CymphonyElixirWeb.Endpoint
@@ -432,6 +435,88 @@ defmodule CymphonyElixir.DashboardLiveTest do
     assert html =~ "AddedFarm"
     assert has_element?(view, ".project-section-name", "AddedFarm")
     refute html =~ "lin_api_fake"
+  end
+
+  test "project controls report applied but unpersisted changes without crashing" do
+    start_dashboard(recipient: self())
+    {:ok, view, _html} = live(build_conn(), "/")
+    config_path = Path.join(CymphonyConfig.config_dir(), "config.json")
+    File.rm!(config_path)
+
+    html = render_submit(view, "set_concurrency", %{"value" => "4"})
+    assert html =~ "Concurrency was applied, but could not be saved"
+    refute html =~ "Concurrency set to 4; persisted"
+    assert_receive {:orchestrator_call, {:set_concurrency, 4}}
+
+    html = render_submit(view, "set_project_concurrency", %{"project" => "default", "value" => "3"})
+    assert html =~ "Concurrency was applied, but could not be saved"
+    assert_receive {:orchestrator_call, {:set_concurrency, 3}}
+
+    html = render_submit(view, "set_project_providers", %{"project" => "default", "value" => "cv1,cz2"})
+    assert html =~ "Providers were applied, but could not be saved"
+    assert_receive {:orchestrator_call, {:set_providers, ["cv1", "cz2"]}}
+
+    html = render_submit(view, "set_project_agent", %{"project" => "default", "agent_kind" => "codex"})
+    assert html =~ "Agent settings were applied, but could not be fully saved"
+    assert_receive {:orchestrator_call, {:set_agent_settings, %{"agent" => "codex"}}}
+  end
+
+  test "project providers reject unsafe aliases without dispatch" do
+    start_dashboard(recipient: self())
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    html = render_submit(view, "set_project_providers", %{"project" => "default", "value" => "cv1; echo bad"})
+    assert html =~ "Providers must be valid shell aliases"
+    refute_receive {:orchestrator_call, {:set_providers, _}}, 50
+  end
+
+  test "Linear connect reports a saved key with a failed workflow rewrite without leaking it" do
+    start_dashboard()
+    {:ok, view, _html} = live(build_conn(), "/")
+    tmp = CymphonyConfig.config_dir()
+    project = %{"name" => "default", "linear_project_slug" => "default-slug", "linear_api_key" => "lin_test"}
+    assert :ok = CymphonyConfig.save(%{"projects" => [project]})
+    workflow_dir = Path.join(tmp, "workflow")
+    File.mkdir_p!(workflow_dir)
+    workflow_path = Path.join(workflow_dir, "WORKFLOW.md")
+    File.write!(workflow_path, WorkflowGenerator.generate(project))
+
+    start_supervised!(%{
+      id: {:dashboard_failed_rewrite_store, "default"},
+      start: {WorkflowStore, :start_link, [[name: ProjectSupervisor.via_tuple("default", :workflow_store), workflow_path: workflow_path]]}
+    })
+
+    owner = self()
+
+    orch =
+      spawn(fn ->
+        {:ok, _} = Registry.register(CymphonyElixir.ProjectRegistry, {"default", :orchestrator}, nil)
+        send(owner, :orch_registered)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :orch_registered
+    on_exit(fn -> Process.exit(orch, :kill) end)
+    File.rm_rf!(workflow_dir)
+    stub_linear_graphql(&linear_success_request/2)
+
+    html = render_submit(view, "connect_linear", %{"api_key" => "lin_api_topsecret"})
+    assert html =~ "Linear key was saved, but a project workflow could not be updated"
+    assert view_assigns(view).linear_status.connected
+    refute html =~ "lin_api_topsecret"
+  end
+
+  test "add project reports generated workflow failure instead of crashing" do
+    start_dashboard()
+    {:ok, view, _html} = live(build_conn(), "/")
+    {:ok, config} = CymphonyConfig.load()
+    assert :ok = CymphonyConfig.save(Map.put(config, "linear_api_key", "lin_test"))
+    Application.put_env(:cymphony_elixir, :workflow_temp_dir, Path.join(CymphonyConfig.config_dir(), "missing"))
+    on_exit(fn -> Application.delete_env(:cymphony_elixir, :workflow_temp_dir) end)
+
+    html = render_submit(view, "add_project", %{"name" => "Farm", "linear_project_slug" => "farm-slug"})
+    assert html =~ "Project was saved but its workflow could not be generated"
+    refute html =~ "Farm added and started"
   end
 
   test "header agent select id is stable and survives stale payload refresh" do

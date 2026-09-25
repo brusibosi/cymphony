@@ -216,14 +216,18 @@ defmodule CymphonyElixirWeb.DashboardLive do
   def handle_event("set_concurrency", %{"value" => raw_value}, socket) do
     case Control.parse_concurrency(raw_value) do
       {:ok, n} ->
-        Control.set_concurrency(:all, n)
+        case Control.set_concurrency(:all, n) do
+          :ok ->
+            socket =
+              socket
+              |> clear_field_draft("global-concurrency")
+              |> put_flash(:info, "Concurrency set to #{n}; persisted to ~/.cymphony/config.json")
 
-        socket =
-          socket
-          |> clear_field_draft("global-concurrency")
-          |> put_flash(:info, "Concurrency set to #{n}; persisted to ~/.cymphony/config.json")
+            {:noreply, reload_payload_now(socket)}
 
-        {:noreply, reload_payload_now(socket)}
+          {:error, _reason} ->
+            {:noreply, reload_payload_now(put_flash(socket, :error, "Concurrency was applied, but could not be saved to config.json"))}
+        end
 
       :error ->
         {:noreply, put_flash(socket, :error, "Concurrency must be a positive integer")}
@@ -271,6 +275,9 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
           {:error, :not_found} ->
             {:noreply, put_flash(socket, :error, "Project not found: #{project_name}")}
+
+          {:error, _reason} ->
+            {:noreply, reload_payload_now(put_flash(socket, :error, "Concurrency was applied, but could not be saved to config.json"))}
         end
 
       :error ->
@@ -297,10 +304,16 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
           {:error, :not_found} ->
             {:noreply, put_flash(socket, :error, "Project not found: #{project_name}")}
+
+          {:error, _reason} ->
+            {:noreply, reload_payload_now(put_flash(socket, :error, "Providers were applied, but could not be saved to config.json"))}
         end
 
       {:error, :empty} ->
         {:noreply, put_flash(socket, :error, "Providers must be a non-empty comma-separated list")}
+
+      {:error, :invalid} ->
+        {:noreply, put_flash(socket, :error, "Providers must be valid shell aliases")}
     end
   end
 
@@ -351,7 +364,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
             socket =
               update(socket, :agent_setting_drafts, &apply_confirmed_draft(&1, project_name, confirmed))
 
-            {:noreply, put_flash(socket, :error, "Could not persist agent settings")}
+            {:noreply, reload_payload_now(put_flash(socket, :error, "Agent settings were applied, but could not be fully saved"))}
         end
 
       :error ->
@@ -371,6 +384,17 @@ defmodule CymphonyElixirWeb.DashboardLive do
          |> assign(:linear_error, nil)
          |> assign(:payload_seq, next_payload_seq(socket))
          |> put_flash(:info, "Linear connected · #{status.masked_key}")}
+
+      {:error, {:workflow_rewrite_failed, _project, _reason} = reason} ->
+        enqueue_linear_projects_load()
+        message = linear_connect_error_message(reason)
+
+        {:noreply,
+         socket
+         |> assign(:linear_status, Control.linear_status())
+         |> assign(:linear_error, message)
+         |> assign(:payload_seq, next_payload_seq(socket))
+         |> put_flash(:error, message)}
 
       {:error, reason} ->
         message = linear_connect_error_message(reason)
@@ -3532,6 +3556,10 @@ defmodule CymphonyElixirWeb.DashboardLive do
     "Linear rejected that API key"
   end
 
+  defp linear_connect_error_message({:workflow_rewrite_failed, _project, _reason}) do
+    "Linear key was saved, but a project workflow could not be updated"
+  end
+
   defp linear_connect_error_message(_reason), do: "Could not reach Linear"
 
   defp add_project_error_message(:duplicate_name), do: "A project with that name already exists"
@@ -3539,5 +3567,6 @@ defmodule CymphonyElixirWeb.DashboardLive do
   defp add_project_error_message(:not_connected), do: "Connect Linear to add a project"
   defp add_project_error_message(:invalid_project), do: "Name and Linear project are required"
   defp add_project_error_message({:project_start_failed, _reason}), do: "Project was saved but failed to start"
+  defp add_project_error_message({:workflow_write_failed, _reason}), do: "Project was saved but its workflow could not be generated"
   defp add_project_error_message(_reason), do: "Could not add project"
 end

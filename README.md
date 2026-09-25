@@ -208,6 +208,7 @@ All routes are under `/api/v1/` and require `?project=...` where shown. Successf
 | `GET` | `/completed?limit=N` | Recent durable completion records (limit capped at 1000) |
 
 If `CYMPHONY_API_TOKEN` is set, send `Authorization: Bearer <token>` to API calls. `POST /linear` validates the key with Linear and never echoes it.
+Control mutations return `422` rather than claiming success if an in-memory change could not be saved; the error message says the change was applied but is not durable. A failed Linear workflow rewrite or new-project workflow generation also returns `422` after the key/project was saved. Retry after correcting the filesystem or configuration. Provider aliases must be safe shell-function names; malformed aliases and non-string provider lists are rejected.
 
 ## Workflow configuration
 

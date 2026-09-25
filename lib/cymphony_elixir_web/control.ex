@@ -15,6 +15,7 @@ defmodule CymphonyElixirWeb.Control do
 
   alias CymphonyElixir.{Agent, Orchestrator, ProjectSupervisor}
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Cymphony.WorkflowGenerator
   alias CymphonyElixir.Linear.Client, as: LinearClient
   alias CymphonyElixirWeb.Endpoint
@@ -74,13 +75,17 @@ defmodule CymphonyElixirWeb.Control do
     end
   end
 
-  @spec set_providers(scope(), [String.t()]) :: :ok | {:error, :not_found}
+  @spec set_providers(scope(), [String.t()]) :: :ok | {:error, term()}
   def set_providers(scope, providers) when is_list(providers) do
-    apply_scope(
-      scope,
-      &Orchestrator.set_providers(&1, providers),
-      fn project -> CymphonyConfig.update_providers(project, providers) end
-    )
+    if providers != [] and Enum.all?(providers, &ShellProvider.valid_name?/1) do
+      apply_scope(
+        scope,
+        &Orchestrator.set_providers(&1, providers),
+        fn project -> CymphonyConfig.update_providers(project, providers) end
+      )
+    else
+      {:error, :invalid_providers}
+    end
   end
 
   @spec set_agent_settings(scope(), map()) :: :ok | {:error, :not_found | term()}
@@ -153,8 +158,8 @@ defmodule CymphonyElixirWeb.Control do
           {:ok, linear_status()} | {:error, :empty | :unauthorized | :invalid | term()}
   def connect_linear(api_key) when is_binary(api_key) do
     with {:ok, _viewer} <- LinearClient.validate_api_key(api_key),
-         {:ok, _config} <- CymphonyConfig.put_linear_api_key(api_key) do
-      rewrite_registered_workflows()
+         {:ok, _config} <- CymphonyConfig.put_linear_api_key(api_key),
+         :ok <- rewrite_registered_workflows() do
       {:ok, linear_status()}
     end
   end
@@ -507,15 +512,21 @@ defmodule CymphonyElixirWeb.Control do
   end
 
   defp start_added_project(project) do
-    {:ok, path} = WorkflowGenerator.write_temp(project)
+    temp_dir = Application.get_env(:cymphony_elixir, :workflow_temp_dir, System.tmp_dir!())
 
-    # Tests may pin {name, path} so start uses a memory-tracker workflow.
-    {start_name, start_path} =
-      Application.get_env(:cymphony_elixir, :start_project_args, {project["name"], path})
+    case WorkflowGenerator.write_temp(project, tmp_dir: temp_dir) do
+      {:ok, path} ->
+        # Tests may pin {name, path} so start uses a memory-tracker workflow.
+        {start_name, start_path} =
+          Application.get_env(:cymphony_elixir, :start_project_args, {project["name"], path})
 
-    case ProjectSupervisor.start_project(start_name, start_path) do
-      :ok -> {:ok, strip_linear_api_key(project)}
-      {:error, reason} -> {:error, {:project_start_failed, reason}}
+        case ProjectSupervisor.start_project(start_name, start_path) do
+          :ok -> {:ok, strip_linear_api_key(project)}
+          {:error, reason} -> {:error, {:project_start_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:workflow_write_failed, reason}}
     end
   end
 
@@ -526,8 +537,12 @@ defmodule CymphonyElixirWeb.Control do
   end
 
   defp rewrite_registered_workflows do
-    Enum.each(ProjectSupervisor.list_orchestrators(), fn {name, _pid} ->
-      _ = ProjectSupervisor.rewrite_workflow(name)
+    Enum.reduce(ProjectSupervisor.list_orchestrators(), :ok, fn {name, _pid}, acc ->
+      case ProjectSupervisor.rewrite_workflow(name) do
+        :ok -> acc
+        {:error, reason} when acc == :ok -> {:error, {:workflow_rewrite_failed, name, reason}}
+        {:error, _reason} -> acc
+      end
     end)
   end
 
