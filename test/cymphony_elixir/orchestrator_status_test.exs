@@ -998,7 +998,7 @@ defmodule CymphonyElixir.OrchestratorStatusTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       tracker_api_token: nil,
-      poll_interval_ms: 50
+      poll_interval_ms: 5_000
     )
 
     orchestrator_name = Module.concat(__MODULE__, :PollCycleOrchestrator)
@@ -1010,38 +1010,20 @@ defmodule CymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    :sys.replace_state(pid, fn state ->
-      %{
-        state
-        | poll_interval_ms: 50,
-          poll_check_in_progress: true,
-          next_poll_due_at_ms: nil
-      }
-    end)
-
-    send(pid, :run_poll_cycle)
-
-    snapshot =
-      wait_for_snapshot(pid, fn
-        %{polling: %{checking?: false, poll_interval_ms: 50, next_poll_in_ms: next_poll_in_ms}}
-        when is_integer(next_poll_in_ms) and next_poll_in_ms <= 50 ->
-          true
-
-        _ ->
-          false
-      end)
+    assert :ok = Orchestrator.run_poll_cycle_for_test(pid)
+    snapshot = GenServer.call(pid, :snapshot)
 
     assert %{
              polling: %{
                checking?: false,
-               poll_interval_ms: 50,
+               poll_interval_ms: 5_000,
                next_poll_in_ms: next_poll_in_ms
              }
            } = snapshot
 
     assert is_integer(next_poll_in_ms)
     assert next_poll_in_ms >= 0
-    assert next_poll_in_ms <= 50
+    assert next_poll_in_ms <= 5_000
   end
 
   test "orchestrator restarts stalled workers with retry backoff" do
@@ -1706,7 +1688,7 @@ defmodule CymphonyElixir.OrchestratorStatusTest do
     end
   end
 
-  defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
+  defp wait_for_snapshot(pid, predicate, timeout_ms) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
   end

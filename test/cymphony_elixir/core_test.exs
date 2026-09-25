@@ -359,8 +359,6 @@ defmodule CymphonyElixir.CoreTest do
         end
       end)
 
-      Process.sleep(50)
-
       assert {:ok, workspace} =
                CymphonyElixir.PathSafety.canonicalize(Path.join(test_root, issue_identifier))
 
@@ -390,8 +388,7 @@ defmodule CymphonyElixir.CoreTest do
         |> Map.put(:retry_attempts, %{})
       end)
 
-      send(pid, :tick)
-      Process.sleep(100)
+      assert :ok = Orchestrator.run_poll_cycle_for_test(pid)
       state = :sys.get_state(pid)
 
       refute Map.has_key?(state.running, issue_id)

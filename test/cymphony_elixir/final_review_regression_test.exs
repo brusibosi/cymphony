@@ -113,7 +113,17 @@ defmodule CymphonyElixir.FinalReviewRegressionTest do
       {{pid, retry}, raw_log} =
         with_log(fn ->
           pid = legacy(ctx, hook_before_run: "cat '#{output}'; exit 7", max_retry_attempts: 1)
-          retry = eventually(fn -> List.first(Orchestrator.snapshot(pid, 100).retrying) end)
+
+          retry =
+            eventually(fn ->
+              case Orchestrator.snapshot(pid, 100) do
+                %{retrying: [entry | _]} -> entry
+                %{retrying: []} -> nil
+                :timeout -> nil
+                :unavailable -> flunk("orchestrator became unavailable while waiting for retry")
+              end
+            end)
+
           {pid, retry}
         end)
 

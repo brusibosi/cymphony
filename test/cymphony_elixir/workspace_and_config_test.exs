@@ -1053,6 +1053,7 @@ defmodule CymphonyElixir.WorkspaceAndConfigTest do
 
       File.write!(fake_ssh, """
       #!/bin/sh
+      IFS= read -r __cymphony_guard_ready || exit 1
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/cymphony-fake-ssh.trace}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
