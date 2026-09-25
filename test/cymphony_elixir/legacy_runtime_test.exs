@@ -46,6 +46,24 @@ defmodule CymphonyElixir.LegacyRuntimeTest do
     assert first == {Process.whereis(LegacySupervisor), Process.whereis(WorkflowStore), Process.whereis(Orchestrator)}
   end
 
+  test "a second legacy startup rejects a different workflow without changing the running one" do
+    first_path = Workflow.workflow_file_path()
+    write_workflow_file!(first_path, tracker_kind: "memory", prompt: "First workflow")
+    assert :ok = CLI.evaluate([first_path])
+    first_runtime = {Process.whereis(LegacySupervisor), Process.whereis(WorkflowStore), Process.whereis(Orchestrator)}
+
+    second_path = Path.join(Path.dirname(first_path), "BROKEN_WORKFLOW.md")
+    File.write!(second_path, "---\ntracker: [\n---\n")
+
+    assert {:error, message} = CLI.evaluate([second_path])
+    assert message =~ "already running with workflow"
+    assert message =~ first_path
+    assert Workflow.workflow_file_path() == first_path
+    assert WorkflowStore.path(Process.whereis(WorkflowStore)) == first_path
+    assert {:ok, %{prompt: "First workflow"}} = WorkflowStore.current()
+    assert first_runtime == {Process.whereis(LegacySupervisor), Process.whereis(WorkflowStore), Process.whereis(Orchestrator)}
+  end
+
   test "malformed legacy workflow returns a startup error without a runtime" do
     path = Workflow.workflow_file_path()
     File.write!(path, "---\ntracker: [\n---\n")

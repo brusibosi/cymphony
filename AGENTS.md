@@ -365,7 +365,7 @@ CymphonyElixir.Supervisor (one_for_one)
 ```
 
 Each project gets its own `ProjectSupervisor` with a `WorkflowStore` and `Orchestrator`, registered via `ProjectRegistry` for lookup by `{project_name, role}`.
-The CLI starts `LegacySupervisor` on demand only for a direct `WORKFLOW.md` path, after `ensure_all_started`; the application and Burrito release can boot without a workflow. Its global store/orchestrator are named and supervised. A repeated legacy start is idempotent, and store/orchestrator startup errors propagate to the CLI (so background startup does not claim a pidfile). Multi-project startup must not start this global runtime.
+The CLI starts `LegacySupervisor` on demand only for a direct `WORKFLOW.md` path, after `ensure_all_started`; the application and Burrito release can boot without a workflow. Its global store/orchestrator are named and supervised. A repeated legacy start with the same path is idempotent; a different path is rejected before changing the global workflow setting (stop the current runtime first). Store/orchestrator startup errors propagate to the CLI (so background startup does not claim a pidfile). Multi-project startup must not start this global runtime.
 
 ## Web Dashboard
 

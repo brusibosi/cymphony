@@ -10,6 +10,24 @@ defmodule CymphonyElixir.LegacySupervisor do
 
   alias CymphonyElixir.{Orchestrator, WorkflowStore}
 
+  @doc "Rejects changing the workflow path of an already-running legacy runtime."
+  @spec ensure_workflow_path(String.t()) :: :ok | {:error, {:already_running_with_workflow, String.t()}}
+  def ensure_workflow_path(path) when is_binary(path) do
+    case Process.whereis(__MODULE__) do
+      nil ->
+        :ok
+
+      _pid ->
+        running_path = WorkflowStore.path(WorkflowStore)
+
+        if running_path == path do
+          :ok
+        else
+          {:error, {:already_running_with_workflow, running_path}}
+        end
+    end
+  end
+
   @doc "Starts the legacy runtime once beneath the application's dynamic supervisor."
   @spec start() :: :ok | {:error, term()}
   def start do
