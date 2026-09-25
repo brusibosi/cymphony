@@ -40,9 +40,10 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
       kill(child)
     end)
 
-    ref = Process.monitor(guard)
+    monitored_guard = guard_pid(guard)
+    ref = Process.monitor(monitored_guard)
     Process.exit(owner, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^guard, :normal}, 2_000
+    assert_receive {:DOWN, ^ref, :process, ^monitored_guard, :normal}, 2_000
     assert_dead(os_pid)
     assert_dead(child)
   end
@@ -53,7 +54,7 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
     {:os_pid, os_pid} = Port.info(port, :os_pid)
     on_exit(fn -> kill(os_pid) end)
     Supervisor.stop(supervisor)
-    refute Process.alive?(guard)
+    refute Process.alive?(guard_pid(guard))
     assert_dead(os_pid)
   end
 
@@ -88,7 +89,7 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
              end)
 
     assert_receive {^port, {:exit_status, 0}}, 1_000
-    assert :ok = PortGuard.finish(PortGuard.watch(guard, port))
+    assert :ok = PortGuard.finish(guard)
   end
 
   test "guard crash fails collection promptly and still kills the tracked OS process" do
@@ -116,7 +117,7 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
     assert_receive {:guard_ready, guard, os_pid}, 1_000
     on_exit(fn -> kill(os_pid) end)
     Process.sleep(30)
-    Process.exit(guard, :kill)
+    Process.exit(guard_pid(guard), :kill)
     assert_receive {:guard_result, {:error, {:port_guard_exit, :killed}}}, 1_000
     assert_dead(os_pid)
   end
@@ -135,10 +136,10 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
       end)
 
     assert :ok = PortGuard.stop_owner(supervisor, unrelated)
-    assert Process.alive?(guard)
+    assert Process.alive?(guard_pid(guard))
     send(unrelated, :stop)
     assert :ok = PortGuard.stop_owner(supervisor, self())
-    refute Process.alive?(guard)
+    refute Process.alive?(guard_pid(guard))
     assert_dead(os_pid)
   end
 
@@ -147,12 +148,12 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
     {:ok, port, guard} = PortGuard.open(supervisor, &sleep_port/0)
     {:os_pid, os_pid} = Port.info(port, :os_pid)
     on_exit(fn -> kill(os_pid) end)
-    :sys.suspend(guard)
+    :sys.suspend(guard_pid(guard))
 
     try do
       assert {:error, {:port_cleanup_failed, _}} = PortGuard.stop_owner(supervisor, self())
     after
-      :sys.resume(guard)
+      :sys.resume(guard_pid(guard))
     end
 
     assert :ok = PortGuard.stop_owner(supervisor, self())
@@ -278,10 +279,11 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
 
     assert_receive {:starting_guard, guard, os_pid}, 1_000
     on_exit(fn -> kill(os_pid) end)
-    ref = Process.monitor(guard)
+    monitored_guard = guard_pid(guard)
+    ref = Process.monitor(monitored_guard)
     Process.exit(owner, :kill)
-    send(guard, :release_initialization)
-    assert_receive {:DOWN, ^ref, :process, ^guard, :normal}, 1_000
+    send(guard_pid(guard), :release_initialization)
+    assert_receive {:DOWN, ^ref, :process, ^monitored_guard, :normal}, 1_000
     assert_dead(os_pid)
     refute File.exists?(marker)
   end
@@ -291,10 +293,41 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
     {:ok, port, guard} = PortGuard.open(supervisor, &sleep_port/0)
     {:os_pid, os_pid} = Port.info(port, :os_pid)
     on_exit(fn -> kill(os_pid) end)
-    send(guard, {:EXIT, port, :epipe})
+    send(guard_pid(guard), {:EXIT, port, :epipe})
     assert_receive {^port, {:exit_status, 1}}, 1_000
     assert :ok = PortGuard.close(guard)
     assert_dead(os_pid)
+  end
+
+  test "owner handle retains a fast wrapper group after the port has closed" do
+    supervisor = start_supervised!(Task.Supervisor)
+    command = PortGuard.prepare("sleep 60 >/dev/null 2>&1 & echo $!; exit 0")
+
+    {:ok, port, guard} =
+      PortGuard.open(
+        supervisor,
+        fn ->
+          {:ok,
+           Port.open(
+             {:spawn_executable, ~c"/bin/sh"},
+             [:binary, :exit_status, args: [~c"-c", String.to_charlist(command)]]
+           )}
+        end,
+        handshake: true
+      )
+
+    assert_receive {^port, {:data, child}}, 1_000
+    child = String.trim(child)
+    on_exit(fn -> kill(child) end)
+    assert_receive {^port, {:exit_status, 0}}, 1_000
+    assert Port.info(port) == nil
+    watch = guard
+    monitored_guard = guard_pid(guard)
+    Process.exit(monitored_guard, :kill)
+    assert_receive {:DOWN, ref, :process, ^monitored_guard, :killed}, 1_000
+    assert ref == watch.ref
+    assert :ok = PortGuard.finish(watch)
+    assert_dead(child)
   end
 
   test "a failed spawn propagates without leaving a guard child" do
@@ -302,6 +335,9 @@ defmodule CymphonyElixir.Agent.PortGuardTest do
     assert {:error, :not_available} = PortGuard.open(supervisor, fn -> {:error, :not_available} end)
     assert DynamicSupervisor.count_children(supervisor).active == 0
   end
+
+  defp guard_pid(%{guard: pid}), do: pid
+  defp guard_pid(pid), do: pid
 
   defp sleep_port do
     {:ok, Port.open({:spawn_executable, ~c"/bin/sleep"}, [:binary, :exit_status, args: [~c"60"]])}

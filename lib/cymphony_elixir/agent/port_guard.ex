@@ -7,21 +7,40 @@ defmodule CymphonyElixir.Agent.PortGuard do
   exiting. OTP's Unix spawn driver gives the child its own process group; group
   leadership is checked before using a negative PID. Detached descendants (and
   remote processes behind a lost SSH connection) cannot be fenced by a local
-  process group.
+  process group. The owner receives an immutable captured identity and monitor
+  handle before readiness is released, so fallback cleanup never re-reads a
+  vanished port or process-group leader.
   """
 
   use GenServer, restart: :temporary
 
+  @type handle :: %{
+          guard: pid(),
+          ref: reference(),
+          port: port(),
+          os_pid: pos_integer() | nil,
+          group?: boolean(),
+          exited?: boolean()
+        }
+
   @spec open(GenServer.server(), (-> {:ok, port()} | {:error, term()})) ::
-          {:ok, port(), pid()} | {:error, term()}
+          {:ok, port(), handle()} | {:error, term()}
   @spec open(GenServer.server(), (-> {:ok, port()} | {:error, term()}), keyword()) ::
-          {:ok, port(), pid()} | {:error, term()}
+          {:ok, port(), handle()} | {:error, term()}
   def open(supervisor, opener, opts \\ []) when is_function(opener, 0) do
     opts = Keyword.merge(opts, owner: self(), opener: opener)
 
     case DynamicSupervisor.start_child(supervisor, {__MODULE__, opts}) do
-      {:ok, guard} -> {:ok, GenServer.call(guard, :port), guard}
-      {:error, reason} -> {:error, reason}
+      {:ok, guard} ->
+        ref = Process.monitor(guard)
+        identity = GenServer.call(guard, :capture)
+        handle = Map.merge(identity, %{guard: guard, ref: ref})
+        # The owner has the original capture before the shell can create children.
+        GenServer.cast(guard, :release)
+        {:ok, handle.port, handle}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -30,9 +49,7 @@ defmodule CymphonyElixir.Agent.PortGuard do
   @spec run(GenServer.server(), (-> {:ok, port()} | {:error, term()}), pos_integer(), keyword()) ::
           {:ok, {binary(), non_neg_integer()}} | {:error, term()}
   def run(supervisor, opener, timeout_ms, opts \\ []) do
-    with {:ok, port, guard} <- open(supervisor, opener, opts) do
-      watch = watch(guard, port)
-
+    with {:ok, port, watch} <- open(supervisor, opener, opts) do
       try do
         collect(port, [], System.monotonic_time(:millisecond) + timeout_ms, watch.ref)
       after
@@ -78,25 +95,7 @@ defmodule CymphonyElixir.Agent.PortGuard do
       if Process.alive?(guard), do: {:error, {:port_cleanup_failed, reason}}, else: :ok
   end
 
-  @spec watch(pid(), port()) :: map()
-  def watch(guard, port) do
-    pid =
-      case Port.info(port, :os_pid) do
-        {:os_pid, pid} -> pid
-        nil -> nil
-      end
-
-    %{
-      guard: guard,
-      ref: Process.monitor(guard),
-      port: port,
-      os_pid: pid,
-      group?: is_integer(pid) and owns_group?(pid),
-      exited?: false
-    }
-  end
-
-  @spec finish(map()) :: :ok
+  @spec finish(handle()) :: :ok
   def finish(watch) do
     Process.demonitor(watch.ref, [:flush])
 
@@ -108,7 +107,9 @@ defmodule CymphonyElixir.Agent.PortGuard do
     :ok
   end
 
-  @spec close(pid()) :: :ok
+  @spec close(pid() | handle()) :: :ok
+  def close(%{} = handle), do: finish(handle)
+
   def close(guard) when is_pid(guard) do
     stop_guard(guard)
     :ok
@@ -138,7 +139,6 @@ defmodule CymphonyElixir.Agent.PortGuard do
           end
 
         group? = is_integer(os_pid) and owns_group?(os_pid)
-        if Keyword.get(opts, :handshake, false) and Process.alive?(owner), do: Port.command(port, "\n")
 
         {:ok,
          %{
@@ -147,7 +147,9 @@ defmodule CymphonyElixir.Agent.PortGuard do
            port: port,
            os_pid: os_pid,
            exited?: false,
-           group?: group?
+           group?: group?,
+           handshake?: Keyword.get(opts, :handshake, false),
+           released?: false
          }}
 
       {:error, reason} ->
@@ -156,8 +158,21 @@ defmodule CymphonyElixir.Agent.PortGuard do
   end
 
   @impl true
-  def handle_call(:port, _from, state), do: {:reply, state.port, state}
+  def handle_call(:capture, _from, state) do
+    {:reply, Map.take(state, [:port, :os_pid, :group?, :exited?]), state}
+  end
+
   def handle_call(:owner, _from, state), do: {:reply, state.owner, state}
+
+  @impl true
+  def handle_cast(:release, state) do
+    if state.handshake? and not state.released? and Process.alive?(state.owner) and
+         Port.info(state.port) != nil do
+      Port.command(state.port, "\n")
+    end
+
+    {:noreply, %{state | released?: true}}
+  end
 
   @impl true
   def handle_info({:DOWN, ref, :process, _owner, _reason}, %{ref: ref} = state), do: {:stop, :normal, state}

@@ -86,7 +86,7 @@ defmodule CymphonyElixir.Agent.Runner do
     run_spec = %{run_spec | prompt: prompt, session_id: session_id}
 
     with {:ok, command} <- agent_module.build_command(run_spec),
-         {:ok, port, guard} <-
+         {:ok, port, guard_watch} <-
            PortGuard.open(
              Map.get(session, :port_supervisor, CymphonyElixir.TaskSupervisor),
              fn ->
@@ -94,8 +94,6 @@ defmodule CymphonyElixir.Agent.Runner do
              end,
              handshake: true
            ) do
-      guard_watch = PortGuard.watch(guard, port)
-
       try do
         metadata = port_metadata(port, worker_host)
         display_session_id = "#{session_id || "new"}"

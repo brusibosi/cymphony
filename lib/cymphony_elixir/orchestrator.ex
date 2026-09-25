@@ -71,6 +71,7 @@ defmodule CymphonyElixir.Orchestrator do
         poll_seen: MapSet.new(),
         startup_cleanup: false,
         restarts: %{},
+        retiring: %{},
         effect_blocked: MapSet.new()
       },
       runtime_providers: %{},
@@ -201,13 +202,7 @@ defmodule CymphonyElixir.Orchestrator do
         {:noreply, finish_io_job(state, ref, {:error, :cleanup_timeout})}
 
       job ->
-        Process.demonitor(ref, [:flush])
-        Task.Supervisor.terminate_child(state.task_supervisor, job.pid)
-        jobs = Map.put(state.work.io_jobs, ref, Map.put(job, :cancelling, true))
-        state = put_work(state, io_jobs: jobs)
-        ports = state.port_supervisor
-        {state, _reap} = start_io_job(state, {:reap, ref}, %{}, fn -> PortGuard.stop_owner(ports, job.pid) end)
-        {:noreply, state}
+        {:noreply, begin_io_reap(state, job, {:error, :io_timeout})}
     end
   end
 
@@ -218,7 +213,11 @@ defmodule CymphonyElixir.Orchestrator do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{work: %{io_jobs: jobs}} = state)
       when is_map_key(jobs, ref) do
-    handle_info({ref, {:error, {:io_worker_exit, reason}}}, state)
+    case Map.fetch!(jobs, ref) do
+      %{cancelling: true} -> {:noreply, state}
+      %{key: {:reap, _}} -> {:noreply, finish_io_job(state, ref, {:error, {:io_worker_exit, reason}})}
+      job -> {:noreply, begin_io_reap(state, job, {:error, {:io_worker_exit, reason}})}
+    end
   end
 
   def handle_info(
@@ -232,6 +231,7 @@ defmodule CymphonyElixir.Orchestrator do
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
+        state = begin_retirement(state, issue_id, running_entry, false)
         session_id = running_entry_session_id(running_entry)
 
         state =
@@ -389,6 +389,26 @@ defmodule CymphonyElixir.Orchestrator do
     {put_work(state, io_jobs: Map.put(state.work.io_jobs, task.ref, job)), task.ref}
   end
 
+  defp begin_io_reap(state, job, failure) do
+    Process.cancel_timer(job.timer)
+
+    if Enum.any?(state.work.io_jobs, fn {_ref, current} -> current.key == {:reap, job.ref} end) do
+      state
+    else
+      start_io_reap(state, job, failure)
+    end
+  end
+
+  defp start_io_reap(state, job, failure) do
+    Process.demonitor(job.ref, [:flush])
+    Task.Supervisor.terminate_child(state.task_supervisor, job.pid)
+    job = job |> Map.put(:cancelling, true) |> Map.put_new(:failure_result, failure)
+    state = put_work(state, io_jobs: Map.put(state.work.io_jobs, job.ref, job))
+    ports = state.port_supervisor
+    {state, _reap} = start_io_job(state, {:reap, job.ref}, %{}, fn -> PortGuard.stop_owner(ports, job.pid) end)
+    state
+  end
+
   defp finish_io_job(state, ref, result) do
     case Map.pop(state.work.io_jobs, ref) do
       {nil, _} ->
@@ -400,7 +420,7 @@ defmodule CymphonyElixir.Orchestrator do
         state = put_work(state, io_jobs: jobs)
         state = apply_io_result(state, job, result)
         notify_dashboard()
-        state |> pump_effects() |> refill_poll_intents(job.key) |> finish_poll_if_idle()
+        state |> pump_effects() |> dispatch_pending_restarts() |> refill_poll_intents(job.key) |> finish_poll_if_idle()
     end
   end
 
@@ -494,8 +514,8 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp apply_io_result(state, %{key: {:reap, ref}}, :ok) do
-    state = put_work(state, cleanup_error: nil)
-    finish_io_job(state, ref, {:error, :io_timeout})
+    state = clear_cleanup_error_if_idle(state)
+    finish_io_job(state, ref, state.work.io_jobs[ref].failure_result)
   end
 
   defp apply_io_result(state, %{key: {:reap, ref}}, error) do
@@ -505,27 +525,51 @@ defmodule CymphonyElixir.Orchestrator do
     put_work(state, io_jobs: jobs, cleanup_error: PublicEvent.sanitize(inspect(error)))
   end
 
-  defp apply_io_result(state, %{key: {:effect, key}, context: %{work: work}}, {:error, {:port_cleanup_failed, _}} = error) do
-    Logger.error("Owned process cleanup failed; retrying without dispatch: #{inspect(error)}")
-    Process.send_after(self(), {:retry_effect, key}, 1_000)
-    put_work(state, effect_queue: Map.put(state.work.effect_queue, key, work), effect_blocked: MapSet.put(state.work.effect_blocked, key), cleanup_error: PublicEvent.sanitize(inspect(error)))
+  defp apply_io_result(state, %{key: {:effect, {:stop, id}}}, :ok) do
+    state
+    |> put_work(retiring: Map.delete(state.work.retiring, id))
+    |> clear_cleanup_error_if_idle()
+    |> release_cleanup_retry(id)
   end
 
-  defp apply_io_result(state, %{key: {:effect, {:stop, id}}}, _result) do
-    {restart, restarts} = Map.pop(state.work.restarts, id)
-    state = put_work(state, restarts: restarts, cleanup_error: nil)
+  defp apply_io_result(state, %{key: {:effect, {:stop, _id}}} = job, error),
+    do: retry_failed_effect(state, job, error)
 
-    if restart && not Map.has_key?(state.running, id) do
-      do_dispatch_issue(state, restart.issue, nil, restart.worker, restart.opts)
-    else
-      state
-    end
-  end
+  defp apply_io_result(state, %{key: {:effect, _key}} = job, {:error, {:port_cleanup_failed, _}} = error),
+    do: retry_failed_effect(state, job, error)
 
   defp apply_io_result(state, %{key: {:effect, :startup}}, _result),
     do: put_work(state, startup_cleanup: false, poll_pending: true)
 
   defp apply_io_result(state, %{key: {:effect, _key}}, _result), do: state
+
+  defp retry_failed_effect(state, %{key: {:effect, key}, context: %{work: work}}, error) do
+    Logger.error("Owned process cleanup failed; retrying without dispatch: #{inspect(error)}")
+    Process.send_after(self(), {:retry_effect, key}, 1_000)
+
+    put_work(state,
+      effect_queue: Map.put(state.work.effect_queue, key, work),
+      effect_blocked: MapSet.put(state.work.effect_blocked, key),
+      cleanup_error: PublicEvent.sanitize(inspect(error))
+    )
+  end
+
+  defp clear_cleanup_error_if_idle(state) do
+    if map_size(state.work.retiring) == 0 and MapSet.size(state.work.effect_blocked) == 0, do: put_work(state, cleanup_error: nil), else: state
+  end
+
+  defp dispatch_pending_restarts(state) do
+    Enum.reduce(state.work.restarts, state, fn {id, restart}, current ->
+      if not Map.has_key?(current.running, id) and not Map.has_key?(current.work.intent_jobs, id) and
+           dispatch_ready?(current, restart.issue, restart.worker) do
+        current
+        |> put_work(restarts: Map.delete(current.work.restarts, id))
+        |> do_dispatch_issue(restart.issue, nil, restart.worker, restart.opts)
+      else
+        current
+      end
+    end)
+  end
 
   defp workflow_changed?(nil, {:ok, _new}), do: true
   defp workflow_changed?(old, {:ok, new}), do: old != new
@@ -655,8 +699,7 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp apply_intent_result(state, ctx, {:ok, issue}) do
-    if not dispatch_cleanup_active?(state) and not effect_active?(state, {:stop, issue.id}) and
-         should_dispatch_issue?(issue, state, active_state_set(state), terminal_state_set(state)) do
+    if should_dispatch_issue?(issue, state, active_state_set(state), terminal_state_set(state)) do
       state = do_dispatch_issue(state, issue, ctx.attempt, ctx.worker, ctx.opts)
 
       if waiting_issue_consumed?(state, issue),
@@ -698,7 +741,7 @@ defmodule CymphonyElixir.Orchestrator do
         Enum.any?(state.work.io_jobs, fn {_ref, job} -> job.key == {:effect, key} end)
 
   defp pump_effects(state) do
-    ready = Enum.find(state.work.effect_queue, fn {key, _} -> not MapSet.member?(state.work.effect_blocked, key) end)
+    ready = Enum.find(state.work.effect_queue, fn {key, _} -> effect_runnable?(state, key) end)
 
     case {map_size(state.work.io_jobs) < 4, ready} do
       {true, {key, work}} ->
@@ -710,6 +753,11 @@ defmodule CymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp effect_runnable?(state, {:issue, id} = key),
+    do: not Map.has_key?(state.work.retiring, id) and not MapSet.member?(state.work.effect_blocked, key)
+
+  defp effect_runnable?(state, key), do: not MapSet.member?(state.work.effect_blocked, key)
 
   defp dispatch_cleanup_active?(state), do: state.work.startup_cleanup or effect_active?(state, :sweep)
 
@@ -864,19 +912,11 @@ defmodule CymphonyElixir.Orchestrator do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+      %{pid: pid, ref: ref, identifier: _identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
-        worker_host = Map.get(running_entry, :worker_host)
-
         state = ensure_runtime_supervisors(state)
         if is_pid(pid), do: terminate_task(state, pid)
-        config = state_config(state)
-        ports = state.port_supervisor
-
-        state =
-          queue_effect(state, {:stop, issue_id}, fn ->
-            reap_issue_process(ports, pid, cleanup_workspace, identifier, worker_host, config)
-          end)
+        state = begin_retirement(state, issue_id, running_entry, cleanup_workspace)
 
         if is_reference(ref) do
           Process.demonitor(ref, [:flush])
@@ -892,6 +932,19 @@ defmodule CymphonyElixir.Orchestrator do
       _ ->
         release_issue_claim(state, issue_id)
     end
+  end
+
+  # A BEAM task's DOWN is not evidence that its OS processes have exited. Keep
+  # its physical-capacity reservation until the original owner's reap returns :ok.
+  defp begin_retirement(state, id, entry, cleanup?) do
+    state = ensure_runtime_supervisors(state)
+    state = put_work(state, retiring: Map.put(state.work.retiring, id, entry))
+    config = state_config(state)
+    ports = state.port_supervisor
+
+    queue_effect(state, {:stop, id}, fn ->
+      reap_issue_process(ports, Map.get(entry, :pid), cleanup?, entry.identifier, Map.get(entry, :worker_host), config)
+    end)
   end
 
   defp reap_issue_process(ports, pid, cleanup?, identifier, worker, config) do
@@ -991,7 +1044,8 @@ defmodule CymphonyElixir.Orchestrator do
       !Map.has_key?(state.running, issue.id) and
       !Map.has_key?(state.retry_attempts, issue.id) and
       !Map.has_key?(state.work.intent_jobs, issue.id) and
-      !effect_active?(state, {:issue, issue.id}) and !effect_active?(state, {:stop, issue.id})
+      !effect_active?(state, {:issue, issue.id}) and !effect_active?(state, {:stop, issue.id}) and
+      !Map.has_key?(state.work.restarts, issue.id)
   end
 
   defp waiting_eligible?(_issue, _state, _active_states, _terminal_states), do: false
@@ -1034,7 +1088,7 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp waiting_capacity_available?(%Issue{} = issue, %State{} = state) do
-    state_slots_available?(issue, state.running, state) and worker_slots_available?(state)
+    dispatch_ready?(state, issue)
   end
 
   defp spawn_waiting_issue(%State{} = state, %Issue{} = issue) do
@@ -1063,9 +1117,8 @@ defmodule CymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running, state) and
-      worker_slots_available?(state)
+      not Map.has_key?(state.work.restarts, issue.id) and
+      dispatch_ready?(state, issue)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
@@ -1080,7 +1133,7 @@ defmodule CymphonyElixir.Orchestrator do
         config.agent.max_concurrent_agents
       )
 
-    used = running_issue_count_for_state(running, issue_state)
+    used = running_issue_count_for_state(Map.merge(state.work.retiring, running), issue_state)
     limit > used
   end
 
@@ -1634,8 +1687,35 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(state, issue_id, attempt, metadata) do
-    issue = %Issue{id: issue_id, identifier: metadata[:identifier] || issue_id}
-    {:noreply, start_intent(state, issue, attempt, metadata[:worker_host], [], :retry, metadata)}
+    if Map.has_key?(state.work.retiring, issue_id) do
+      entry = Map.fetch!(state.retry_attempts, issue_id)
+      entry = Map.merge(entry, %{cleanup_wait: true, timer_ref: nil, cleanup_manual: Map.get(entry, :cleanup_manual, false) or metadata[:manual] == true})
+      {:noreply, %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, entry)}}
+    else
+      issue = %Issue{id: issue_id, identifier: metadata[:identifier] || issue_id}
+      {:noreply, start_intent(state, issue, attempt, metadata[:worker_host], [], :retry, metadata)}
+    end
+  end
+
+  defp release_cleanup_retry(state, id) do
+    case Map.get(state.retry_attempts, id) do
+      %{cleanup_wait: true} = entry -> release_cleanup_retry_entry(state, id, entry)
+      _ -> state
+    end
+  end
+
+  defp release_cleanup_retry_entry(state, id, entry) do
+    manual? = Map.get(entry, :cleanup_manual, false)
+    updated = Map.drop(entry, [:cleanup_wait, :cleanup_manual, :held])
+    state = %{state | retry_attempts: Map.put(state.retry_attempts, id, updated)}
+
+    if state.paused and not manual? do
+      hold_retry_attempt(state, id, entry.retry_token)
+    else
+      {:ok, attempt, metadata, state} = fetch_retry_attempt_state(state, id, entry.retry_token)
+      {:noreply, state} = handle_retry_issue(state, id, attempt, Map.put(metadata, :manual, manual?))
+      state
+    end
   end
 
   defp handle_retry_issue_lookup(%Issue{} = issue, %State{} = state, issue_id, attempt, metadata) do
@@ -1740,11 +1820,8 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(%State{} = state, issue, attempt, metadata) do
-    if not dispatch_cleanup_active?(state) and not effect_active?(state, {:issue, issue.id}) and
-         not effect_active?(state, {:stop, issue.id}) and
-         retry_candidate_issue?(issue, active_state_set(state), terminal_state_set(state)) and
-         dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
+    if retry_candidate_issue?(issue, active_state_set(state), terminal_state_set(state)) and
+         dispatch_ready?(state, issue, metadata[:worker_host]) do
       {:noreply, do_dispatch_issue(state, issue, attempt, metadata[:worker_host], failures: metadata[:failures] || 0)}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
@@ -1967,15 +2044,11 @@ defmodule CymphonyElixir.Orchestrator do
     worker = state_config(state).worker
 
     Dispatch.select_worker_host(
-      state.running,
+      capacity_running(state),
       worker.ssh_hosts,
       worker.max_concurrent_agents_per_host,
       preferred_worker_host
     )
-  end
-
-  defp worker_slots_available?(%State{} = state) do
-    select_worker_host(state, nil) != :no_worker_capacity
   end
 
   defp worker_slots_available?(%State{} = state, preferred_worker_host) do
@@ -2008,10 +2081,18 @@ defmodule CymphonyElixir.Orchestrator do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
+  defp capacity_running(state), do: Map.merge(state.work.retiring, state.running)
+
+  defp dispatch_ready?(state, issue, worker \\ nil) do
+    not dispatch_cleanup_active?(state) and not Map.has_key?(state.work.retiring, issue.id) and
+      not effect_active?(state, {:issue, issue.id}) and not effect_active?(state, {:stop, issue.id}) and
+      dispatch_slots_available?(issue, state) and worker_slots_available?(state, worker)
+  end
+
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || state_config(state).agent.max_concurrent_agents) -
-        map_size(state.running) - map_size(state.work.intent_jobs),
+        map_size(capacity_running(state)) - map_size(state.work.intent_jobs),
       0
     )
   end
@@ -2325,7 +2406,8 @@ defmodule CymphonyElixir.Orchestrator do
   def handle_call({:set_concurrency, n}, _from, state) when is_integer(n) and n > 0 do
     Logger.info("Concurrency updated: max_concurrent_agents=#{n}")
     notify_dashboard()
-    {:reply, :ok, %{state | max_concurrent_agents: n, runtime_concurrency: n}}
+    state = %{state | max_concurrent_agents: n, runtime_concurrency: n}
+    {:reply, :ok, dispatch_pending_restarts(state)}
   end
 
   def handle_call({:set_concurrency, _n}, _from, state) do
