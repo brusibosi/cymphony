@@ -3,6 +3,69 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
 
   alias CymphonyElixir.Orchestrator.State
 
+  test "duplicate retry timers leave an in-flight refresh and its ownership unchanged" do
+    issue = issue("retry-single-flight", "MT-SINGLE", "In Progress")
+    endpoint = linear_endpoint(issue, by_id: %{issue | state: "Done"})
+    state = retry_state(issue, endpoint)
+    message = {:retry_issue, issue.id, state.retry_attempts[issue.id].retry_token}
+    {:noreply, in_flight} = Orchestrator.handle_info(message, state)
+    assert Map.has_key?(in_flight.work.intent_jobs, issue.id)
+    assert {:noreply, ^in_flight} = Orchestrator.handle_info(message, in_flight)
+    result = await_io(in_flight)
+    refute Map.has_key?(result.retry_attempts, issue.id)
+    assert_receive {:linear_query, :by_id}
+    refute_receive {:linear_query, :poll}
+  end
+
+  test "ninety retries at full capacity perform no tracker reads or coding attempts" do
+    issue = issue("capacity", "MT-CAPACITY", "In Progress")
+    endpoint = linear_endpoint(issue, by_id: issue)
+    initial = retry_state(issue, endpoint)
+    entry = initial.retry_attempts[issue.id]
+    retries = Map.new(1..90, fn n -> {"capacity-#{n}", %{entry | identifier: "MT-#{n}", retry_token: make_ref()}} end)
+    occupied = %{issue: issue("occupied", "MT-OCCUPIED", "In Progress"), worker_host: nil}
+    state = %{initial | running: %{"occupied" => occupied}, retry_attempts: retries, claimed: MapSet.new(Map.keys(retries))}
+
+    result =
+      Enum.reduce(retries, state, fn {id, retry}, acc ->
+        {:noreply, next} = apply_info({:retry_issue, id, retry.retry_token}, acc)
+        next
+      end)
+
+    assert map_size(result.retry_attempts) == 90
+    assert Enum.all?(result.retry_attempts, fn {_id, retry} -> retry.attempt == 2 and retry.failures == 3 end)
+    assert Map.keys(result.running) == ["occupied"]
+    refute_receive {:linear_query, _}
+    Enum.each(result.retry_attempts, fn {_id, retry} -> if is_reference(retry.timer_ref), do: Process.cancel_timer(retry.timer_ref) end)
+  end
+
+  test "a retry refreshes its exact issue without scanning the whole project" do
+    issue = issue("retry-direct", "MT-DIRECT", "In Progress")
+    endpoint = linear_endpoint(issue, by_id: %{issue | state: "Done"})
+    state = retry_state(issue, endpoint)
+    token = state.retry_attempts[issue.id].retry_token
+
+    {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
+
+    refute Map.has_key?(result.retry_attempts, issue.id)
+    assert_receive {:linear_query, :by_id}
+    refute_receive {:linear_query, :poll}
+  end
+
+  test "project run count starts at zero independently of retained agent history and resets on restart" do
+    state = %State{config: Config.settings!(), recent_completed: Enum.to_list(1..100)}
+    {:reply, snapshot, _} = Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+    assert snapshot.completed_count == 0
+
+    state = state |> Map.put(:completed_issue_ids, MapSet.new(["done"])) |> Map.put(:paused, false)
+    {:reply, :ok, same_run} = Orchestrator.handle_call(:resume, {self(), make_ref()}, state)
+    assert MapSet.size(same_run.completed_issue_ids) == 1
+
+    {:reply, :ok, restarted} = Orchestrator.handle_call(:resume, {self(), make_ref()}, %{same_run | paused: true})
+    assert MapSet.size(restarted.completed_issue_ids) == 0
+    assert restarted.recent_completed == state.recent_completed
+  end
+
   test "a terminal issue found by dispatch revalidation releases its retry claim" do
     issue = issue("retry-stale", "MT-STALE", "In Progress")
     endpoint = linear_endpoint(issue, by_id: %{issue | state: "Done"})
@@ -14,7 +77,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
     assert result.running == %{}
     refute Map.has_key?(result.retry_attempts, issue.id)
     refute MapSet.member?(result.claimed, issue.id)
-    assert_receive {:linear_query, :poll}
+    refute_receive {:linear_query, :poll}
     assert_receive {:linear_query, :by_id}
   end
 
@@ -55,22 +118,22 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
 
     assert result.running == %{}
 
-    assert %{attempt: 3, failures: 3, identifier: "MT-ERROR", timer_ref: timer_ref} =
+    assert %{attempt: 2, failures: 3, identifier: "MT-ERROR", timer_ref: timer_ref} =
              result.retry_attempts[issue.id]
 
     assert is_reference(timer_ref)
     assert MapSet.member?(result.claimed, issue.id)
   end
 
-  test "a failed retry poll remains scheduled without spending the failure budget" do
+  test "a failed direct retry lookup remains scheduled without spending the failure budget" do
     issue = issue("retry-poll-error", "MT-POLL-ERROR", "In Progress")
-    endpoint = linear_endpoint(issue, by_id: issue, poll: {:error, "temporary outage"})
+    endpoint = linear_endpoint(issue, by_id: {:error, "temporary outage"})
     state = retry_state(issue, endpoint)
     token = state.retry_attempts[issue.id].retry_token
 
     {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
-    assert %{attempt: 3, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
+    assert %{attempt: 2, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
     assert is_reference(timer_ref)
     assert MapSet.member?(result.claimed, issue.id)
   end
@@ -83,7 +146,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
 
     {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
-    assert %{attempt: 3, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
+    assert %{attempt: 2, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
     assert is_reference(timer_ref)
     assert result.running == %{}
     assert MapSet.member?(result.claimed, issue.id)
@@ -101,7 +164,7 @@ defmodule CymphonyElixir.Orchestrator.RetryOwnershipTest do
 
     {:noreply, result} = apply_info({:retry_issue, issue.id, token}, state)
 
-    assert %{attempt: 3, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
+    assert %{attempt: 2, failures: 3, timer_ref: timer_ref} = result.retry_attempts[issue.id]
     assert is_reference(timer_ref)
     assert MapSet.member?(result.claimed, issue.id)
     refute Map.has_key?(result.running, issue.id)

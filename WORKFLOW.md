@@ -28,6 +28,8 @@ workspace:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  # Caps transient retry backoff; provider holds and Linear Retry-After remain authoritative.
+  max_retry_backoff_ms: 300000
 claude:
   command: claude
   output_format: stream-json

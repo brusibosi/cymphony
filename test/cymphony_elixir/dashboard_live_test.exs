@@ -2219,13 +2219,13 @@ defmodule CymphonyElixir.DashboardLiveTest do
     :erlang.trace(view.pid, false, [:send])
 
     # A real retry update still lands, including its fresh clock anchor.
-    retrying = %{retrying | attempt: 3}
+    retrying = %{retrying | attempt: 3, failed_attempts: 3}
     projects = Enum.map(projects, &%{&1 | retrying: [retrying]})
     changed = %{drifted | projects: projects, retrying: [retrying]}
     send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, changed))
     render(view)
     assert DateTime.compare(view_assigns(view).now, now_before) == :gt
-    assert has_element?(view, ".retry-row .chip--warn", "Attempt 3")
+    assert has_element?(view, ".retry-row .chip--warn", "Failed starts 3")
   end
 
   for queue_size <- [3, 100] do

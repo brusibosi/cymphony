@@ -448,6 +448,7 @@ defmodule CymphonyElixir.ExtensionsTest do
                "running" => 1,
                "retrying" => 1,
                "waiting" => 0,
+               "completed" => 0,
                "by_state" => %{"In Progress" => 1},
                "by_kind" => %{"unknown" => 1}
              },
@@ -487,6 +488,9 @@ defmodule CymphonyElixir.ExtensionsTest do
                  "issue_url" => nil,
                  "priority" => nil,
                  "attempt" => 2,
+                 "failed_attempts" => 2,
+                 "wait_reason" => nil,
+                 "hold_reason" => nil,
                  "held" => false,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
@@ -2277,6 +2281,7 @@ defmodule CymphonyElixir.ExtensionsTest do
              "running" => 1,
              "retrying" => 1,
              "waiting" => 0,
+             "completed" => 0,
              "by_state" => %{"In Progress" => 1},
              "by_kind" => %{"unknown" => 1}
            }

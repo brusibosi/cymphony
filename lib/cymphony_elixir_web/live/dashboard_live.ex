@@ -1246,7 +1246,8 @@ defmodule CymphonyElixirWeb.DashboardLive do
                     <% end %>
                   </div>
                   <div class="retry-row-attempt">
-                    <span class="chip chip--warn">Attempt <%= entry.attempt %></span>
+                    <span class="chip chip--warn">Failed starts <%= Map.get(entry, :failed_attempts, entry.attempt) %></span>
+                    <span :if={Map.get(entry, :wait_reason)} class="chip chip--held"><%= retry_wait_label(entry) %></span>
                     <%= if entry.due_at do %>
                       <span class="muted">due <span data-clock="due" data-remaining-ms={retry_remaining_ms(entry.due_at, @now)}><%= format_retry_countdown(entry.due_at, @now) %></span></span>
                     <% end %>
@@ -1254,7 +1255,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                     grammar as its "Attempt N" neighbour but no amber, and it
                     mutes the row's retry edge (see `.retry-row--held`). --%>
                     <%= if Map.get(entry, :held) do %>
-                      <span class="chip chip--held" title="Dispatch is paused; this retry is not counting down">Held</span>
+                      <span class="chip chip--held" title="Waiting for dispatch or required operator action">Held</span>
                     <% end %>
                   </div>
                   <div class="retry-row-error advanced-only">
@@ -1262,7 +1263,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                       <span class="muted small mono"><%= String.slice(to_string(entry.error), 0, 120) %></span>
                     <% end %>
                   </div>
-                  <span class="retry-row-guidance simple-only">Cymphony will retry automatically.</span>
+                  <span class="retry-row-guidance simple-only"><%= retry_guidance(entry) %></span>
                   <button
                     type="button"
                     class="subtle-button"
@@ -1282,7 +1283,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                 <div>
                   <h2 class="section-title">Recent agent runs</h2>
                   <p class="section-copy simple-only"><%= length(@completions) %> recent agent runs.</p>
-                  <p class="section-copy advanced-only">Last <%= length(@completions) %> agent runs. Cleared on daemon restart.</p>
+                  <p class="section-copy advanced-only">Last <%= length(@completions) %> agent runs. History is retained; the ticket counter covers the current project run.</p>
                 </div>
                 <button
                   type="button"
@@ -1303,7 +1304,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                         <%= if Map.get(entry, :project_name), do: entry.project_name, else: "" %>
                       </div>
                       <div class="session-row-chips">
-                        <span class="chip chip--ok">Done</span>
+                        <span class="chip chip--ok">Run ended</span>
                         <%= if Map.get(entry, :agent_kind) do %>
                           <span class="chip chip--agent chip--icon advanced-only" title={entry.agent_kind}>
                             <.agent_icon kind={entry.agent_kind} />
@@ -2854,7 +2855,27 @@ defmodule CymphonyElixirWeb.DashboardLive do
   # dispatch is paused. `.retry-row--held` mutes the amber retry edge so a paused
   # board does not read as a wall of warnings.
   defp retry_row_class(entry) do
-    if Map.get(entry, :held), do: "retry-row retry-row--held", else: "retry-row"
+    if Map.get(entry, :held) or Map.get(entry, :wait_reason) in [:capacity, :rate_limit, :authentication, :quota], do: "retry-row retry-row--held", else: "retry-row"
+  end
+
+  defp retry_wait_label(entry) do
+    case Map.get(entry, :wait_reason) do
+      :capacity -> "Waiting for capacity"
+      :rate_limit -> "Linear cooldown"
+      :authentication -> "Provider login required"
+      :quota -> "Provider quota exhausted"
+      _ -> "Waiting"
+    end
+  end
+
+  defp retry_guidance(entry) do
+    case Map.get(entry, :wait_reason) do
+      :authentication -> "Sign in to the provider, then choose Retry now."
+      :quota -> "Wait for the provider reset, or restore quota and choose Retry now."
+      :capacity -> "Work will resume when a worker is available."
+      :rate_limit -> "Waiting for Linear's allowance to recover."
+      _ -> if Map.get(entry, :held), do: "Dispatch is paused.", else: "Cymphony will retry automatically."
+    end
   end
 
   defp queue_edit_open?(ids, project_name) do

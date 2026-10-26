@@ -347,6 +347,9 @@ defmodule CymphonyElixirWeb.Presenter do
       issue_url: issue_field(entry, :url),
       priority: issue_field(entry, :priority),
       attempt: entry.attempt,
+      failed_attempts: Map.get(entry, :failed_attempts, entry.attempt),
+      wait_reason: Map.get(entry, :wait_reason),
+      hold_reason: Map.get(entry, :hold_reason),
       held: held?(entry),
       due_at: due_at_iso8601(entry),
       error: entry.error,
@@ -457,6 +460,9 @@ defmodule CymphonyElixirWeb.Presenter do
   defp retry_issue_payload(retry) do
     %{
       attempt: retry.attempt,
+      failed_attempts: Map.get(retry, :failed_attempts, retry.attempt),
+      wait_reason: Map.get(retry, :wait_reason),
+      hold_reason: Map.get(retry, :hold_reason),
       held: held?(retry),
       due_at: due_at_iso8601(retry),
       error: retry.error,

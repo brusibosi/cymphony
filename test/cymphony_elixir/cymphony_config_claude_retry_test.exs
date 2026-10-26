@@ -89,7 +89,7 @@ defmodule CymphonyElixir.Cymphony.ConfigClaudeRetryTest do
     test "invalid stored values fall back to the safe defaults instead of breaking the project", %{tmp: tmp} do
       log =
         capture_log(fn ->
-          for bad_bare <- ["false", 0, nil], bad_backoff <- [0, -1, 1.5, "600000", false] do
+          for bad_bare <- ["false", 0, nil], bad_backoff <- [nil, 0, -1, 1.5, "600000", false] do
             project =
               @project
               |> Map.put("claude_bare_mode", bad_bare)

@@ -23,8 +23,9 @@ defmodule CymphonyElixir.Orchestrator do
   }
 
   alias CymphonyElixir.Agent.PortGuard
+  alias CymphonyElixir.Agent.ProviderFailure
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
-  alias CymphonyElixir.Linear.Issue
+  alias CymphonyElixir.Linear.{Issue, RateLimit}
   alias CymphonyElixir.Orchestrator.{Dispatch, Queue, Stall, Tokens}
   alias CymphonyElixirWeb.ObservabilityPubSub
 
@@ -70,6 +71,7 @@ defmodule CymphonyElixir.Orchestrator do
         poll_generation: 0,
         poll_seen: MapSet.new(),
         startup_cleanup: false,
+        completion_run_id: nil,
         restarts: %{},
         retiring: %{},
         effect_blocked: MapSet.new()
@@ -82,6 +84,9 @@ defmodule CymphonyElixir.Orchestrator do
       queue_pins: %{},
       queue_priority_seen: %{},
       recent_completed: [],
+      completed_issue_ids: MapSet.new(),
+      pending_completed_issue_ids: MapSet.new(),
+      provider_holds: %{},
       claimed: MapSet.new(),
       retry_attempts: %{},
       token_totals: nil,
@@ -108,7 +113,7 @@ defmodule CymphonyElixir.Orchestrator do
       config: config,
       task_supervisor: Keyword.get(opts, :task_supervisor),
       port_supervisor: Keyword.get(opts, :port_supervisor),
-      work: Map.put(%State{}.work, :io_timeout_ms, Keyword.get(opts, :io_timeout_ms, 30_000)),
+      work: %State{}.work |> Map.put(:io_timeout_ms, Keyword.get(opts, :io_timeout_ms, 30_000)) |> Map.put(:completion_run_id, make_ref()),
       project_name: project_name,
       prompt_template: prompt_template,
       paused: load_project_dispatch_paused(project_name),
@@ -181,7 +186,7 @@ defmodule CymphonyElixir.Orchestrator do
 
   def handle_info(:watchdog, state) do
     Process.send_after(self(), :watchdog, 1_000)
-    {:noreply, reconcile_stalled_running_issues(state)}
+    {:noreply, state |> reconcile_stalled_running_issues() |> wake_provider_retries()}
   end
 
   def handle_info({ref, result}, state) when is_reference(ref) do
@@ -240,6 +245,7 @@ defmodule CymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
+              |> clear_provider_hold(running_entry)
               |> complete_issue(issue_id, running_entry)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
@@ -251,16 +257,7 @@ defmodule CymphonyElixir.Orchestrator do
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
-              next_attempt = next_retry_attempt_from_running(running_entry)
-              failures = running_entry_failure_count(running_entry) + 1
-
-              maybe_retry_or_abandon(state, issue_id, next_attempt, failures, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{PublicEvent.format_diagnostic(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path),
-                failures: failures
-              })
+              handle_worker_failure(state, issue_id, running_entry, reason)
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -636,12 +633,51 @@ defmodule CymphonyElixir.Orchestrator do
   defp finish_poll_if_idle(state), do: state
 
   defp start_intent(state, issue, attempt, worker, opts, source, metadata) do
+    case intent_admission(state, issue, worker, source, metadata) do
+      :existing ->
+        state
+
+      {:provider, entry} ->
+        park_provider_retry(state, entry.issue, attempt, metadata, entry.provider_hold_key, state.provider_holds[entry.provider_hold_key])
+
+      {:wait, reason, delay} ->
+        defer_intent(state, issue, attempt, source, metadata, reason, delay)
+
+      :ready ->
+        start_ready_intent(state, issue, attempt, worker, opts, source, metadata)
+    end
+  end
+
+  defp intent_admission(state, issue, worker, source, metadata) do
+    cond do
+      Map.has_key?(state.work.intent_jobs, issue.id) -> :existing
+      automatic_provider_hold?(state, issue.id, source, metadata) -> {:provider, state.retry_attempts[issue.id]}
+      tracker_wait_ms(state) > 0 -> {:wait, :rate_limit, tracker_wait_ms(state)}
+      source == :retry and retry_capacity_full?(state, worker) -> {:wait, :capacity, nil}
+      true -> :ready
+    end
+  end
+
+  defp automatic_provider_hold?(state, id, source, metadata),
+    do: source == :retry and metadata[:manual] != true and retry_provider_held?(state, id)
+
+  defp retry_capacity_full?(state, worker), do: available_slots(state) == 0 or not worker_slots_available?(state, worker)
+  defp defer_intent(state, _issue, _attempt, source, _metadata, _reason, _delay) when source != :retry, do: state
+
+  defp defer_intent(state, issue, attempt, _source, metadata, reason, delay) do
+    message = if reason == :capacity, do: "waiting for available capacity", else: "waiting for Linear rate limit"
+    metadata = Map.merge(metadata, %{error: message, wait_reason: reason})
+    metadata = if delay, do: Map.put(metadata, :delay_ms, delay), else: metadata
+    schedule_issue_retry(state, issue.id, attempt, metadata)
+  end
+
+  defp start_ready_intent(state, issue, attempt, worker, opts, source, metadata) do
     cond do
       Map.has_key?(state.work.intent_jobs, issue.id) ->
         state
 
       map_size(state.work.intent_jobs) >= min(4, max(1, state.max_concurrent_agents || 1)) ->
-        if source == :retry, do: schedule_issue_retry(state, issue.id, attempt + 1, metadata), else: state
+        if source == :retry, do: schedule_issue_retry(state, issue.id, attempt, metadata), else: state
 
       true ->
         config = state.config
@@ -660,22 +696,13 @@ defmodule CymphonyElixir.Orchestrator do
           manual: metadata[:manual] == true
         }
 
-        {state, ref} =
-          start_io_job(state, {:intent, issue.id}, ctx, fn -> fetch_intent(ctx, terminal) end)
-
+        {state, ref} = start_io_job(state, {:intent, issue.id}, ctx, fn -> fetch_intent(ctx, terminal) end)
         seen = if source == :waiting, do: MapSet.put(state.work.poll_seen, issue.id), else: state.work.poll_seen
         put_work(state, intent_jobs: Map.put(state.work.intent_jobs, issue.id, ref), poll_seen: seen)
     end
   end
 
-  defp fetch_intent(%{source: :retry} = ctx, terminal) do
-    with {:ok, issues} <- Tracker.fetch_candidate_issues(ctx.config) do
-      issues |> find_issue_by_id(ctx.issue.id) |> revalidate_intent(ctx.config, terminal)
-    end
-  end
-
   defp fetch_intent(ctx, terminal), do: revalidate_intent(ctx.issue, ctx.config, terminal)
-  defp revalidate_intent(nil, _config, _terminal), do: {:skip, :missing}
 
   defp revalidate_intent(issue, config, terminal) do
     active = config.tracker.active_states |> Enum.map(&normalize_issue_state/1) |> MapSet.new()
@@ -712,6 +739,8 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp apply_intent_result(state, ctx, {:skip, skipped}) do
+    state = confirm_completed_issue(state, skipped)
+
     state =
       if ctx.source == :retry and is_struct(skipped, Issue) and
            terminal_issue_state?(skipped.state, terminal_state_set(state)) do
@@ -843,7 +872,7 @@ defmodule CymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state |> confirm_completed_issue(issue) |> terminate_running_issue(issue.id, true)
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -1285,10 +1314,16 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp reschedule_failed_retry_refresh(state, %Issue{} = issue, attempt, reason)
        when is_integer(attempt) do
-    schedule_issue_retry(state, issue.id, attempt + 1, %{
+    previous = Map.get(state.retry_attempts, issue.id, %{})
+
+    metadata = %{
       identifier: issue.identifier,
-      error: "dispatch refresh failed: #{PublicEvent.format_diagnostic(reason)}"
-    })
+      error: "dispatch refresh failed: #{PublicEvent.format_diagnostic(reason)}",
+      refresh_attempt: Map.get(previous, :refresh_attempt, 0) + 1
+    }
+
+    metadata = if tracker_wait_ms(state) > 0, do: Map.merge(metadata, %{wait_reason: :rate_limit, delay_ms: tracker_wait_ms(state)}), else: metadata
+    schedule_issue_retry(state, issue.id, attempt, metadata)
   end
 
   defp reschedule_failed_retry_refresh(state, _issue, _attempt, _reason), do: state
@@ -1301,7 +1336,7 @@ defmodule CymphonyElixir.Orchestrator do
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
 
         if is_integer(attempt) do
-          schedule_issue_retry(state, issue.id, attempt + 1, %{
+          schedule_issue_retry(state, issue.id, attempt, %{
             identifier: issue.identifier,
             error: "no SSH worker slots available"
           })
@@ -1316,13 +1351,20 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, opts) do
     spec = state |> dispatch_run_spec(issue, opts) |> Map.put(:run_token, make_ref())
+    key = provider_scope(state, spec)
 
-    case start_issue_agent_task(state, issue, attempt, recipient, worker_host, spec) do
-      {:ok, pid} ->
-        track_spawned_issue(state, issue, attempt, worker_host, spec, pid, opts)
+    cond do
+      tracker_wait_ms(state) > 0 ->
+        schedule_issue_retry(state, issue.id, attempt || 1, %{identifier: issue.identifier, wait_reason: :rate_limit, error: "waiting for Linear rate limit", delay_ms: tracker_wait_ms(state)})
 
-      {:error, reason} ->
-        handle_spawn_failure(state, issue, attempt, worker_host, reason, opts)
+      active_provider_hold?(Map.get(state.provider_holds, key)) and not Keyword.get(opts, :provider_probe, false) ->
+        park_provider_retry(state, issue, attempt || 1, %{worker_host: worker_host}, key, state.provider_holds[key])
+
+      true ->
+        case start_issue_agent_task(state, issue, attempt, recipient, worker_host, spec) do
+          {:ok, pid} -> track_spawned_issue(state, issue, attempt, worker_host, spec, pid, opts)
+          {:error, reason} -> handle_spawn_failure(state, issue, attempt, worker_host, reason, opts)
+        end
     end
   end
 
@@ -1419,7 +1461,9 @@ defmodule CymphonyElixir.Orchestrator do
         state.running,
         issue.id,
         append_log_event(
-          initial_running_entry(issue, attempt, worker_host, spec, pid, ref, opts),
+          initial_running_entry(issue, attempt, worker_host, spec, pid, ref, opts)
+          |> Map.put(:completion_run_id, state.work.completion_run_id)
+          |> Map.put(:provider_scope, provider_scope(state, spec)),
           :agent_dispatched,
           spawned_issue_log_detail(worker_host, spec, attempt)
         )
@@ -1428,6 +1472,7 @@ defmodule CymphonyElixir.Orchestrator do
     %{
       state
       | running: running,
+        pending_completed_issue_ids: MapSet.delete(state.pending_completed_issue_ids, issue.id),
         claimed: MapSet.put(state.claimed, issue.id),
         retry_attempts: Map.delete(state.retry_attempts, issue.id)
     }
@@ -1512,9 +1557,40 @@ defmodule CymphonyElixir.Orchestrator do
     %{
       state
       | recent_completed: recent,
+        pending_completed_issue_ids:
+          if(Map.get(running_entry, :completion_run_id, state.work.completion_run_id) == state.work.completion_run_id,
+            do: MapSet.put(state.pending_completed_issue_ids, issue_id),
+            else: state.pending_completed_issue_ids
+          ),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
+
+  defp confirm_completed_issue(state, %Issue{} = issue) do
+    entry = Map.get(state.running, issue.id)
+
+    assigned_in_run =
+      MapSet.member?(state.pending_completed_issue_ids, issue.id) or
+        (is_map(entry) and Map.get(entry, :completion_run_id, state.work.completion_run_id) == state.work.completion_run_id)
+
+    completed =
+      case Map.get(issue, :state_type) do
+        "completed" ->
+          true
+
+        type when is_binary(type) ->
+          false
+
+        _ ->
+          terminal_issue_state?(issue.state, terminal_state_set(state)) and
+            normalize_issue_state(issue.state) not in ["canceled", "cancelled", "duplicate"]
+      end
+
+    ids = if completed and assigned_in_run, do: MapSet.put(state.completed_issue_ids, issue.id), else: state.completed_issue_ids
+    %{state | completed_issue_ids: ids, pending_completed_issue_ids: MapSet.delete(state.pending_completed_issue_ids, issue.id)}
+  end
+
+  defp confirm_completed_issue(state, _issue), do: state
 
   defp persist_completed_record(record) do
     CompletionStore.put_async(record)
@@ -1560,12 +1636,14 @@ defmodule CymphonyElixir.Orchestrator do
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
-    next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
+    next_attempt = if is_integer(attempt), do: max(attempt, 1), else: previous_retry.attempt + 1
 
     metadata_with_backoff =
       Map.put_new(metadata, :max_retry_backoff_ms, state.config.agent.max_retry_backoff_ms)
 
-    delay_ms = retry_delay(next_attempt, metadata_with_backoff)
+    backoff_attempt = next_attempt + Map.get(metadata, :refresh_attempt, 0)
+    delay_ms = Map.get(metadata, :delay_ms) || retry_delay(backoff_attempt, metadata_with_backoff)
+    delay_ms = min(max(delay_ms, 1), 4_294_967_295)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
@@ -1579,7 +1657,8 @@ defmodule CymphonyElixir.Orchestrator do
       Process.cancel_timer(old_timer)
     end
 
-    timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+    retry_message = {:retry_issue, issue_id, retry_token}
+    timer_ref = if metadata[:suspend] != true, do: Process.send_after(self(), retry_message, delay_ms)
 
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
@@ -1597,7 +1676,13 @@ defmodule CymphonyElixir.Orchestrator do
             error: PublicEvent.sanitize(error),
             worker_host: worker_host,
             workspace_path: workspace_path,
-            failures: failures
+            failures: failures,
+            wait_reason: Map.get(metadata, :wait_reason),
+            refresh_attempt: Map.get(metadata, :refresh_attempt, 0),
+            provider_hold_key: Map.get(metadata, :provider_hold_key),
+            hold_reason: Map.get(metadata, :hold_reason),
+            issue: Map.get(metadata, :issue),
+            held: metadata[:suspend] == true
           })
     }
   end
@@ -1624,6 +1709,8 @@ defmodule CymphonyElixir.Orchestrator do
   defp release_held_retries(%State{} = state) do
     %{state | retry_attempts: Map.new(state.retry_attempts, &release_held_retry/1)}
   end
+
+  defp release_held_retry({issue_id, %{provider_hold_key: key} = retry_entry}) when not is_nil(key), do: {issue_id, retry_entry}
 
   defp release_held_retry({issue_id, %{held: true} = retry_entry}) do
     retry_token = make_ref()
@@ -1826,8 +1913,9 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp handle_active_retry(%State{} = state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, active_state_set(state), terminal_state_set(state)) and
-         dispatch_ready?(state, issue, metadata[:worker_host]) do
-      {:noreply, do_dispatch_issue(state, issue, attempt, metadata[:worker_host], failures: metadata[:failures] || 0)}
+         dispatch_ready?(state, issue, metadata[:worker_host], metadata[:manual] == true) do
+      opts = [failures: metadata[:failures] || 0, provider_probe: metadata[:manual] == true]
+      {:noreply, do_dispatch_issue(state, issue, attempt, metadata[:worker_host], opts)}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -1835,7 +1923,7 @@ defmodule CymphonyElixir.Orchestrator do
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
            error: "no available orchestrator slots"
@@ -1850,11 +1938,99 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp release_retry_claim(%State{} = state, issue_id) do
     state = release_issue_claim(state, issue_id)
-    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id), pending_completed_issue_ids: MapSet.delete(state.pending_completed_issue_ids, issue_id)}
   end
 
   defp running_entry_failure_count(running_entry) do
     Map.get(running_entry, :failure_count, 0)
+  end
+
+  defp handle_worker_failure(state, issue_id, entry, reason) do
+    failures = running_entry_failure_count(entry)
+
+    metadata = %{
+      identifier: entry.identifier,
+      error: "agent exited: #{PublicEvent.format_diagnostic(reason)}",
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      failures: failures
+    }
+
+    case provider_failure(reason) do
+      nil -> maybe_retry_or_abandon(state, issue_id, next_retry_attempt_from_running(entry), failures + 1, Map.put(metadata, :failures, failures + 1))
+      failure -> hold_failed_provider(state, entry, Map.get(entry, :retry_attempt) || 1, metadata, failure)
+    end
+  end
+
+  defp tracker_wait_ms(state), do: if(state.config.tracker.kind == "linear", do: RateLimit.remaining(state.config, Application.get_env(:cymphony_elixir, :linear_graphql_opts, [])), else: 0)
+
+  defp provider_failure({%ProviderFailure{} = failure, _stack}), do: failure
+  defp provider_failure(%ProviderFailure{} = failure), do: failure
+  defp provider_failure(_reason), do: nil
+
+  defp retry_provider_held?(state, id) do
+    case Map.get(state.retry_attempts, id) do
+      %{provider_hold_key: key} when not is_nil(key) -> active_provider_hold?(Map.get(state.provider_holds, key))
+      _ -> false
+    end
+  end
+
+  defp provider_scope(state, spec) do
+    {spec.agent_kind, Map.get(spec, :provider), Map.get(spec, :model), :erlang.phash2(Agent.section(state_config(state), spec.agent_kind))}
+  end
+
+  defp active_provider_hold?(%{retry_at: nil}), do: true
+  defp active_provider_hold?(%{retry_at: until_ms}), do: until_ms > System.system_time(:millisecond)
+  defp active_provider_hold?(_hold), do: false
+
+  defp clear_provider_hold(state, entry) do
+    %{state | provider_holds: Map.delete(state.provider_holds, Map.get(entry, :provider_scope))}
+  end
+
+  defp hold_failed_provider(state, entry, attempt, metadata, failure) do
+    spec = %{agent_kind: Map.get(entry, :agent_kind, state.config.agent.kind), provider: Map.get(entry, :provider), model: Map.get(entry, :model)}
+    key = Map.get(entry, :provider_scope, provider_scope(state, spec))
+    hold = %{kind: failure.kind, retry_at: failure.retry_at, message: failure.message}
+    state = %{state | provider_holds: Map.put(state.provider_holds, key, hold)}
+    park_provider_retry(state, entry.issue, attempt, metadata, key, hold)
+  end
+
+  defp park_provider_retry(state, issue, attempt, metadata, key, hold) do
+    delay = if is_integer(hold.retry_at), do: max(hold.retry_at - System.system_time(:millisecond), 1), else: 1
+
+    metadata =
+      Map.merge(metadata, %{
+        identifier: issue.identifier,
+        error: hold.message,
+        wait_reason: hold.kind,
+        provider_hold_key: key,
+        hold_reason: hold.kind,
+        issue: issue,
+        delay_ms: delay,
+        suspend: is_nil(hold.retry_at)
+      })
+
+    state = schedule_issue_retry(state, issue.id, attempt, metadata)
+    %{state | claimed: MapSet.put(state.claimed, issue.id)}
+  end
+
+  defp wake_provider_retries(%{paused: true} = state), do: state
+
+  defp wake_provider_retries(state) do
+    Enum.reduce(state.retry_attempts, state, fn
+      {id, %{provider_hold_key: key, issue: %Issue{} = issue} = retry}, current when not is_nil(key) ->
+        spec = dispatch_run_spec(current, issue, [])
+
+        if provider_scope(current, spec) != key or not active_provider_hold?(Map.get(current.provider_holds, key)) do
+          metadata = Map.take(retry, [:identifier, :worker_host, :failures]) |> Map.put(:delay_ms, 1)
+          schedule_issue_retry(current, id, retry.attempt, metadata)
+        else
+          current
+        end
+
+      _, current ->
+        current
+    end)
   end
 
   defp state_config(%State{config: nil}), do: load_config()
@@ -2054,16 +2230,6 @@ defmodule CymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host) != :no_worker_capacity
   end
 
-  defp find_issue_by_id(issues, issue_id) when is_binary(issue_id) do
-    Enum.find(issues, fn
-      %Issue{id: ^issue_id} ->
-        true
-
-      _ ->
-        false
-    end)
-  end
-
   defp find_issue_id_for_ref(running, ref) do
     running
     |> Enum.find_value(fn {issue_id, %{ref: running_ref}} ->
@@ -2082,10 +2248,11 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp capacity_running(state), do: Map.merge(state.work.retiring, state.running)
 
-  defp dispatch_ready?(state, issue, worker \\ nil) do
+  defp dispatch_ready?(state, issue, worker \\ nil, provider_probe \\ false) do
     not dispatch_cleanup_active?(state) and not Map.has_key?(state.work.retiring, issue.id) and
       not effect_active?(state, {:issue, issue.id}) and not effect_active?(state, {:stop, issue.id}) and
-      dispatch_slots_available?(issue, state) and worker_slots_available?(state, worker)
+      dispatch_slots_available?(issue, state) and worker_slots_available?(state, worker) and
+      (provider_probe or not active_provider_hold?(Map.get(state.provider_holds, provider_scope(state, dispatch_run_spec(state, issue, [])))))
   end
 
   defp available_slots(%State{} = state) do
@@ -2284,6 +2451,9 @@ defmodule CymphonyElixir.Orchestrator do
           # instant. Without it a paused board also churns, because a
           # presenter deriving `due_at` from `now + 0` moves every load.
           held: Map.get(retry, :held) == true,
+          wait_reason: Map.get(retry, :wait_reason),
+          hold_reason: Map.get(retry, :hold_reason),
+          failed_attempts: Map.get(retry, :failures, 0),
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
           error: Map.get(retry, :error),
@@ -2303,6 +2473,7 @@ defmodule CymphonyElixir.Orchestrator do
        waiting: waiting,
        retrying: retrying,
        recent_completed: state.recent_completed,
+       completed_count: MapSet.size(state.completed_issue_ids),
        token_totals: state.token_totals,
        rate_limits: Map.get(state, :rate_limits),
        providers: state.providers || [],
@@ -2328,6 +2499,7 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   def handle_call(:resume, _from, state) do
+    state = if state.paused, do: %{state | completed_issue_ids: MapSet.new(), pending_completed_issue_ids: MapSet.new(), work: Map.put(state.work, :completion_run_id, make_ref())}, else: state
     state = release_held_retries(%{state | paused: false})
     notify_dashboard()
     {:reply, :ok, state}

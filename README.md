@@ -16,6 +16,14 @@ These are the supported kinds returned by `CymphonyElixir.Agent.known_kinds/0`: 
 
 **Release status (2026-09-25):** This README describes current `main`. The latest published package is v2.8.2 (2026-08-18); it predates the unreleased hardening and behavior documented here, although `main` still reports version `2.8.2`. Build from source for current-`main` behavior; do not assume the published v2.8.2 binaries include it.
 
+## Retry safety and project-run counts
+
+Retries check dispatch capacity before contacting Linear and refresh the exact project-scoped issue instead of scanning the project. Linear429 and explicit GraphQL rate-limit responses establish a shared endpoint/credential cooldown; requests already in flight may finish. Recognized provider login/quota refusals are actionable holds, not repeated coding failures. A known quota reset can resume work automatically; an unknown reset or invalid login needs corrective action and **Retry now**. Manual retry does not bypass Linear cooldowns.
+
+The dashboard/API `counts.completed` and each project's `completed_count` count distinct tracker-confirmed completed tickets in the current run, without a100-ticket cap. Pause followed by Resume starts a new project run and resets only that project's counter; repeated Resume while running and browser/worker refreshes do not. Fresh project runtime startup also starts at zero. Canceled/duplicate issues, failed workers and active continuation turns are not completed tickets. The bounded recent agent-run history is separate and remains durable across restarts.
+
+Tests use a private completion database under the test build's `tmp/test-logs` directory; they do not append synthetic sessions to the operator's history.
+
 ## What it does
 
 - Watches one or many Linear projects in one daemon.

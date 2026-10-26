@@ -112,6 +112,18 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     refute Map.has_key?(result.retry_attempts, issue.id)
   end
 
+  test "manual retry at capacity after an initial provider refusal preserves a valid wait", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :authentication)
+    busy = %{held | max_concurrent_agents: 0, paused: true}
+
+    {:reply, :ok, waiting} = apply_call({:retry_issue_now, issue.id}, busy)
+    assert waiting.running == %{}
+    assert waiting.retry_attempts[issue.id].attempt >= 1
+    assert waiting.retry_attempts[issue.id].failures == 0
+    assert waiting.retry_attempts[issue.id].wait_reason == :capacity
+  end
+
   test "a provider hold blocks the matching assignment while another model can dispatch", ctx do
     {state, issue} = running_state(ctx)
     held = provider_down(state, issue, :authentication)
