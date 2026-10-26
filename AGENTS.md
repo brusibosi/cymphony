@@ -324,6 +324,23 @@ route, no dashboard control.
   logged and treated as unset — falling back to the default `true` — instead of failing
   `Schema.parse/1` and taking the project down over a typo'd boolean.
 
+### Per-project `claude_bare_mode` / `max_retry_backoff_ms` (flat config keys)
+
+Flat keys on a `projects[]` entry in `~/.cymphony/config.json` (the project `agent` stays a
+plain string). `to_schema_map/1` maps them to the native nested workflow fields:
+
+- `claude_bare_mode` (boolean) → `claude.bare_mode`. Absent emits nothing, so the adapter default
+  (`true`, `--bare`) applies; an explicit `false` is emitted and drops `--bare`, and an explicit
+  `true` is emitted too. A non-boolean stored value is logged and ignored (default `true`).
+- `max_retry_backoff_ms` (positive integer) → `agent.max_retry_backoff_ms`. Absent keeps the
+  schema default (`300000`); `0`, negatives, floats and strings are logged and ignored rather than
+  removing the cap or failing `Schema.parse/1`.
+- `Config.update_agent_settings/2` accepts both keys next to `agent`/`model`/`effort`; `nil`
+  deletes the key. Invalid values return `{:error, :invalid_claude_bare_mode}` /
+  `{:error, :invalid_max_retry_backoff_ms}` before `config.json` is loaded, so a valid existing
+  value is never replaced. Other `update_*` writers load-modify-save the whole project, so the
+  keys survive unrelated saves and workflow regeneration.
+
 ### Generated `WORKFLOW.md` files (mode 0600)
 
 - Generated per-project workflow files embed the Linear API key in cleartext
