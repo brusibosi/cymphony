@@ -1505,6 +1505,7 @@ defmodule CymphonyElixir.Orchestrator do
       turn_count: 0,
       retry_attempt: normalize_retry_attempt(attempt),
       failure_count: Keyword.get(opts, :failures, 0),
+      provider_probe: Keyword.get(opts, :provider_probe, false),
       started_at: DateTime.utc_now(),
       log_events: []
     }
@@ -1983,9 +1984,11 @@ defmodule CymphonyElixir.Orchestrator do
   defp active_provider_hold?(%{retry_at: until_ms}), do: until_ms > System.system_time(:millisecond)
   defp active_provider_hold?(_hold), do: false
 
-  defp clear_provider_hold(state, entry) do
+  defp clear_provider_hold(state, %{provider_probe: true} = entry) do
     %{state | provider_holds: Map.delete(state.provider_holds, Map.get(entry, :provider_scope))}
   end
+
+  defp clear_provider_hold(state, _entry), do: state
 
   defp hold_failed_provider(state, entry, attempt, metadata, failure) do
     spec = %{agent_kind: Map.get(entry, :agent_kind, state.config.agent.kind), provider: Map.get(entry, :provider), model: Map.get(entry, :model)}

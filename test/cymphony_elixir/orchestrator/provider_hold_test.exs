@@ -108,8 +108,23 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     {:reply, :ok, result} = apply_call({:retry_issue_now, issue.id}, %{held | paused: true})
     assert %{pid: pid, failure_count: 0} = result.running[issue.id]
     assert is_pid(pid)
+    assert result.running[issue.id].provider_probe
     assert result.paused
     refute Map.has_key?(result.retry_attempts, issue.id)
+  end
+
+  test "a sibling already running before quota refusal cannot clear the scoped hold", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :quota)
+    [key] = Map.keys(held.provider_holds)
+    sibling = %{issue | id: "in-flight-sibling", identifier: "MT-SIBLING"}
+    entry = state.running[issue.id] |> Map.put(:issue, sibling) |> Map.put(:identifier, sibling.identifier) |> Map.put(:provider_scope, key)
+    state = %{held | running: %{sibling.id => entry}}
+
+    after_sibling = apply_info({:DOWN, entry.ref, :process, entry.pid, :normal}, state)
+    assert after_sibling.provider_holds == held.provider_holds
+    assert after_sibling.retry_attempts[issue.id].hold_reason == :quota
+    assert after_sibling.retry_attempts[issue.id].timer_ref == nil
   end
 
   test "manual retry at capacity after an initial provider refusal preserves a valid wait", ctx do

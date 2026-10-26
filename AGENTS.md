@@ -265,10 +265,10 @@ CLI → CymphonyConfig → WorkflowStore → Orchestrator (GenServer, per-projec
 ### Retry admission and completed-ticket counters
 
 - Capacity waits perform no retry-related tracker read and preserve coding-attempt/failure counts. Retry refreshes use the exact project-scoped by-ID query; moved or newly blocked issues are not dispatched.
-- `Linear.RateLimit` shares HTTP429/explicit GraphQL rate-limit cooldowns across projects using the same endpoint and hashed authorization. Retry-After takes precedence over the native initial-backoff fallback. It is node-local; existing in-flight requests may finish and daemon restart clears the registry.
+- `Linear.RateLimit` shares HTTP 429/explicit GraphQL rate-limit cooldowns across projects using the same endpoint and hashed authorization. Retry-After takes precedence over the native initial-backoff fallback. It is node-local; existing in-flight requests may finish and daemon restart clears the registry.
 - `Agent.ProviderFailure` accepts only recognized CLI error envelopes, not words inside tool/test output. Typed authentication/quota refusals reach the orchestrator and park the affected assignment; unknown resets need manual action. Holds do not consume the coding-failure budget. Config/run-spec changes and known expiry are rechecked by the watchdog; explicit Retry may probe while paused but cannot bypass Linear cooldowns.
 - `snapshot.completed_count` -> API `projects[].completed_count` / aggregate `counts.completed` is an uncapped set of distinct tracker-confirmed completed issue IDs for the current project run. A normal agent turn only becomes a pending completion until the tracker confirms completion. Canceled/duplicate/active issues do not count. Paused->Resume and fresh runtime startup reset that project's set; repeated Resume, page refreshes and worker retries do not. Prior-run worker completions cannot enter a restarted run.
-- Recent100agent-run records remain a bounded durable history and are never used as the ticket counter. `MIX_ENV=test` pins the completion store as well as both log sinks to private test storage.
+- The most recent 100 agent-run records remain a bounded durable history and are never used as the ticket counter. `MIX_ENV=test` pins the completion store as well as both log sinks to private test storage.
 
 ### Stall watchdog (`stall_timeout_ms`)
 

@@ -5,7 +5,7 @@ defmodule CymphonyElixir.Orchestrator.ReliabilityReplayTest do
   alias CymphonyElixirWeb.Presenter
 
   @tag timeout: 30_000
-  test "two native projects replay 200 issues and 90 retries through capacity, shared 429, and stub recovery" do
+  test "two native projects replay 200 issues and 90 retries through capacity, shared 429, quota, and stub recovery" do
     root = Path.dirname(Workflow.workflow_file_path())
     config_dir = Path.join(root, "config")
     File.mkdir_p!(config_dir)
@@ -35,6 +35,11 @@ defmodule CymphonyElixir.Orchestrator.ReliabilityReplayTest do
       fi
       trap 'rmdir ../.stub-active' EXIT
       echo "$PWD" >> '#{launches}'
+      if [ -f '#{root}/quota-once' ] && [ "$(basename "$PWD")" = BETA-1 ]; then
+        rm '#{root}/quota-once'
+        printf '%s\\n' '{"type":"assistant","isApiErrorMessage":true,"error":"usage_limit_reached"}'
+        exit 1
+      fi
       sleep 0.05
       touch .stub-complete
       printf '%s\\n' '{"session_id":"offline-stub","result":"completed","usage":{"input_tokens":1,"output_tokens":1}}'
@@ -130,6 +135,7 @@ defmodule CymphonyElixir.Orchestrator.ReliabilityReplayTest do
     refute File.exists?(launches)
 
     Agent.update(clock, fn _ -> 1_060_001 end)
+    File.touch!(Path.join(root, "quota-once"))
 
     Enum.each(actors, fn {_, slug, pid} ->
       id = "#{slug}-1"
@@ -138,9 +144,24 @@ defmodule CymphonyElixir.Orchestrator.ReliabilityReplayTest do
       send(pid, {:retry_issue, id, retry.retry_token})
     end)
 
-    eventually(fn -> Enum.all?(actors, fn {_, _, pid} -> Orchestrator.snapshot(pid, 1_000).completed_count == 1 end) end)
-    refute File.exists?(Path.join(root, "capacity-exceeded"))
+    [{_, _, alpha}, {_, _, beta}] = actors
+
+    eventually(fn ->
+      Orchestrator.snapshot(alpha, 1_000).completed_count == 1 and
+        match?(%{held: true, hold_reason: :quota}, :sys.get_state(beta).retry_attempts["beta-1"])
+    end)
+
+    held = :sys.get_state(beta).retry_attempts["beta-1"]
+    assert held.failures == 3
+    assert held.timer_ref == nil
+    Enum.each(1..8, fn _ -> send(beta, :watchdog) end)
+    :sys.get_state(beta)
     assert length(File.read!(launches) |> String.split("\n", trim: true)) == 2
+    assert :ok = GenServer.call(beta, {:retry_issue_now, "beta-1"})
+    eventually(fn -> Enum.all?(actors, fn {_, _, pid} -> Orchestrator.snapshot(pid, 1_000).completed_count == 1 end) end)
+    assert :sys.get_state(beta).provider_holds == %{}
+    refute File.exists?(Path.join(root, "capacity-exceeded"))
+    assert length(File.read!(launches) |> String.split("\n", trim: true)) == 3
     assert Agent.get(ledger, &MapSet.size(&1.completed)) == 2
 
     recovery_calls = Enum.drop(requests(ledger), length(limited_calls))
@@ -159,7 +180,6 @@ defmodule CymphonyElixir.Orchestrator.ReliabilityReplayTest do
     end)
 
     assert Presenter.state_payload(first, 1_000).counts.completed == 2
-    [{_, _, alpha}, {_, _, beta}] = actors
     assert :ok = GenServer.call(alpha, :pause)
     assert :ok = GenServer.call(alpha, :resume)
     assert :ok = GenServer.call(beta, :resume)
