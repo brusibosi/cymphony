@@ -115,6 +115,7 @@ defmodule CymphonyElixir.PresenterMetricsTest do
                running: 2,
                retrying: 1,
                waiting: 0,
+               completed: 0,
                by_state: %{"In Progress" => 1, "Todo" => 1},
                by_kind: %{"claude" => 1, "unknown" => 1}
              }
@@ -232,7 +233,7 @@ defmodule CymphonyElixir.PresenterMetricsTest do
 
       payload = Presenter.state_payload(orchestrator, 50)
 
-      assert payload.counts == %{running: 0, retrying: 0, waiting: 0, by_state: %{}, by_kind: %{}}
+      assert payload.counts == %{running: 0, retrying: 0, waiting: 0, completed: 0, by_state: %{}, by_kind: %{}}
 
       assert payload.token_totals == %{
                input_tokens: 0,

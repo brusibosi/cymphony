@@ -1888,7 +1888,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     assigns = view_assigns(view)
     assert assigns.payload_error == %{code: "snapshot_timeout", message: "Snapshot timed out"}
-    assert assigns.counts == %{running: 0, retrying: 0, waiting: 0, by_state: %{}, by_kind: %{}}
+    assert assigns.counts == %{running: 0, retrying: 0, waiting: 0, completed: 0, by_state: %{}, by_kind: %{}}
     assert assigns.token_totals == %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     assert assigns.rate_limits == nil
     assert assigns.polling == nil

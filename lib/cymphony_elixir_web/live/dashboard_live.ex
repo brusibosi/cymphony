@@ -26,7 +26,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
   # section. `waiting: []` has no assign of its own (waiting rows live inside each
   # project entry) but stays here because SPEC §13.3 pins it on the default payload.
   @default_payload %{
-    counts: %{running: 0, retrying: 0, waiting: 0, by_state: %{}, by_kind: %{}},
+    counts: %{running: 0, retrying: 0, waiting: 0, completed: 0, by_state: %{}, by_kind: %{}},
     running: [],
     retrying: [],
     waiting: [],
@@ -781,9 +781,9 @@ defmodule CymphonyElixirWeb.DashboardLive do
             </a>
           <% end %>
           <%= if @completions != [] do %>
-            <a class="rail-link" href="#completions-section" title="Completions">
+            <a class="rail-link" href="#completions-section" title="Recent agent runs">
               <span class="rail-led rail-led--done" aria-hidden="true"></span>
-              <span class="rail-link-name">Completions</span>
+              <span class="rail-link-name">Agent runs</span>
               <span class="rail-link-meta numeric advanced-only"><%= length(@completions) %></span>
             </a>
           <% end %>
@@ -837,7 +837,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   <a class="jump-menu-link" href={"#project-" <> project_dom_id(project.name)}><%= project.name %></a>
                 <% end %>
                 <%= if @completions != [] do %>
-                  <a class="jump-menu-link" href="#completions-section">Completions</a>
+                  <a class="jump-menu-link" href="#completions-section">Agent runs</a>
                 <% end %>
               </nav>
             </details>
@@ -946,6 +946,10 @@ defmodule CymphonyElixirWeb.DashboardLive do
             <div class="metric-pill metric-pill--queue section--queue advanced-only">
               <span class="metric-pill-label">Queue</span>
               <span class="metric-pill-value numeric"><%= Map.get(@counts, :waiting, 0) %></span>
+            </div>
+            <div class="metric-pill" id="completed-ticket-count" title="Distinct tickets completed in the current project runs. Each project's count resets when it resumes after a pause.">
+              <span class="metric-pill-label">Completed</span>
+              <span class="metric-pill-value numeric"><%= Map.get(@counts, :completed, 0) %></span>
             </div>
             <div class="metric-pill">
               <span class="metric-pill-label simple-only">Usage</span>
@@ -1109,6 +1113,8 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   <span class="muted">queued</span>
                   · <span class="numeric"><%= project.retrying_count %></span>
                   <span class="muted">retrying</span>
+                  · <span class="numeric" data-completed-count={Map.get(project, :completed_count, 0)}><%= Map.get(project, :completed_count, 0) %></span>
+                  <span class="muted">completed this run</span>
                 </p>
               </div>
 
@@ -1274,8 +1280,8 @@ defmodule CymphonyElixirWeb.DashboardLive do
             <section class="section-card section--completions" id="completions-section">
               <div class="section-header">
                 <div>
-                  <h2 class="section-title">Recent completions</h2>
-                  <p class="section-copy simple-only"><%= length(@completions) %> recently finished tasks.</p>
+                  <h2 class="section-title">Recent agent runs</h2>
+                  <p class="section-copy simple-only"><%= length(@completions) %> recent agent runs.</p>
                   <p class="section-copy advanced-only">Last <%= length(@completions) %> agent runs. Cleared on daemon restart.</p>
                 </div>
                 <button
@@ -1515,7 +1521,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
           <div class="settings-row">
             <span class="inline-label">sections</span>
-            <%= for {label, key} <- [{"Metrics", "metrics"}, {"Polling", "polling"}, {"Rate limits", "ratelimits"}, {"Completions", "completions"}, {"States", "states"}, {"Kinds", "kinds"}, {"Board", "board"}] do %>
+            <%= for {label, key} <- [{"Metrics", "metrics"}, {"Polling", "polling"}, {"Rate limits", "ratelimits"}, {"Agent runs", "completions"}, {"States", "states"}, {"Kinds", "kinds"}, {"Board", "board"}] do %>
               <label><input type="checkbox" data-pref-section={key} checked /> <%= label %></label>
             <% end %>
           </div>
@@ -1528,7 +1534,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
           </div>
 
           <div class="settings-row">
-            <span class="inline-label">completions shown</span>
+            <span class="inline-label">agent runs shown</span>
             <select data-pref="completions-limit" class="inline-input inline-input--narrow">
               <option value="25">25</option>
               <option value="50">50</option>
