@@ -105,7 +105,7 @@ defmodule CymphonyElixir.CompletionStore do
 
   @impl true
   def init(opts) do
-    path = Keyword.get(opts, :path, default_path())
+    path = Keyword.get(opts, :path, Application.get_env(:cymphony_elixir, :completion_store_path, default_path()))
 
     case open_and_migrate(path) do
       {:ok, db} ->

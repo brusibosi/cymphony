@@ -5,7 +5,7 @@ defmodule CymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias CymphonyElixir.Agent.Runner
+  alias CymphonyElixir.Agent.{ProviderFailure, Runner}
   alias CymphonyElixir.{Config, HarnessStream, Linear.Issue, PromptBuilder, PublicEvent, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
@@ -31,6 +31,10 @@ defmodule CymphonyElixir.AgentRunner do
     case run_on_worker_host(issue, agent_update_recipient, opts, worker_host) do
       :ok ->
         :ok
+
+      {:error, %ProviderFailure{} = failure} ->
+        Logger.warning("Provider unavailable for #{issue_context(issue)}: #{failure.message}")
+        raise failure
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")

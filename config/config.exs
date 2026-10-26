@@ -27,6 +27,7 @@ if config_env() == :test do
   test_log_root = Path.expand("../tmp/test-logs", __DIR__)
 
   config :cymphony_elixir,
+    completion_store_path: Path.join(test_log_root, "sessions.db"),
     log_file: Path.join([test_log_root, "log", "cymphony.log"]),
     daemon_log_file: Path.join(test_log_root, "daemon.log")
 end

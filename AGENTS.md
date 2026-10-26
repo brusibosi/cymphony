@@ -262,6 +262,14 @@ CLI → CymphonyConfig → WorkflowStore → Orchestrator (GenServer, per-projec
   explicit operator override and still dispatches while paused; the gate covers the timer-driven
   backoff loop only.
 
+### Retry admission and completed-ticket counters
+
+- Capacity waits perform no retry-related tracker read and preserve coding-attempt/failure counts. Retry refreshes use the exact project-scoped by-ID query; moved or newly blocked issues are not dispatched.
+- `Linear.RateLimit` shares HTTP 429/explicit GraphQL rate-limit cooldowns across projects using the same endpoint and hashed authorization. Retry-After takes precedence over the native initial-backoff fallback. It is node-local; existing in-flight requests may finish and daemon restart clears the registry.
+- `Agent.ProviderFailure` accepts only recognized CLI error envelopes, not words inside tool/test output. Typed authentication/quota refusals reach the orchestrator and park the affected assignment; unknown resets need manual action. Holds do not consume the coding-failure budget. Config/run-spec changes and known expiry are rechecked by the watchdog; explicit Retry may probe while paused but cannot bypass Linear cooldowns.
+- `snapshot.completed_count` -> API `projects[].completed_count` / aggregate `counts.completed` is an uncapped set of distinct tracker-confirmed completed issue IDs for the current project run. A normal agent turn only becomes a pending completion until the tracker confirms completion. Canceled/duplicate/active issues do not count. Paused->Resume and fresh runtime startup reset that project's set; repeated Resume, page refreshes and worker retries do not. Prior-run worker completions cannot enter a restarted run.
+- The most recent 100 agent-run records remain a bounded durable history and are never used as the ticket counter. `MIX_ENV=test` pins the completion store as well as both log sinks to private test storage.
+
 ### Stall watchdog (`stall_timeout_ms`)
 
 - Every tick, `reconcile_stalled_running_issues/1` compares each running session's silence
@@ -323,6 +331,23 @@ route, no dashboard control.
   and Ecto's string spellings parse normally, while any other value (`0`, `"no"`, `"off"`) is
   logged and treated as unset — falling back to the default `true` — instead of failing
   `Schema.parse/1` and taking the project down over a typo'd boolean.
+
+### Per-project `claude_bare_mode` / `max_retry_backoff_ms` (flat config keys)
+
+Flat keys on a `projects[]` entry in `~/.cymphony/config.json` (the project `agent` stays a
+plain string). `to_schema_map/1` maps them to the native nested workflow fields:
+
+- `claude_bare_mode` (boolean) → `claude.bare_mode`. Absent emits nothing, so the adapter default
+  (`true`, `--bare`) applies; an explicit `false` is emitted and drops `--bare`, and an explicit
+  `true` is emitted too. A non-boolean stored value is logged and ignored (default `true`).
+- `max_retry_backoff_ms` (positive integer) → `agent.max_retry_backoff_ms`. Absent keeps the
+  schema default (`300000`); `0`, negatives, floats and strings are logged and ignored rather than
+  removing the cap or failing `Schema.parse/1`.
+- `Config.update_agent_settings/2` accepts both keys next to `agent`/`model`/`effort`; `nil`
+  deletes the key. Invalid values return `{:error, :invalid_claude_bare_mode}` /
+  `{:error, :invalid_max_retry_backoff_ms}` before `config.json` is loaded, so a valid existing
+  value is never replaced. Other `update_*` writers load-modify-save the whole project, so the
+  keys survive unrelated saves and workflow regeneration.
 
 ### Generated `WORKFLOW.md` files (mode 0600)
 

@@ -5,6 +5,12 @@ defmodule CymphonyElixir.CompletionStoreTest do
 
   alias CymphonyElixir.CompletionStore
 
+  test "the test application stores session history outside the operator's state directory" do
+    %{path: path} = :sys.get_state(CompletionStore)
+    assert path == Application.fetch_env!(:cymphony_elixir, :completion_store_path)
+    refute String.starts_with?(path, Path.expand("~/.cymphony"))
+  end
+
   setup do
     dir = Path.join(System.tmp_dir!(), "cymphony-store-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)

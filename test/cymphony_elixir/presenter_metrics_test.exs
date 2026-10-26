@@ -79,6 +79,18 @@ defmodule CymphonyElixir.PresenterMetricsTest do
       :ok
     end
 
+    test "provider holds retain actionable reason and real failure count" do
+      orchestrator = unique_name("ProviderHold")
+      retry = Map.merge(retry_entry(), %{held: true, wait_reason: :authentication, hold_reason: :authentication, failed_attempts: 0})
+      start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: snapshot_fixture(retrying: [retry])})
+      payload = Presenter.state_payload(orchestrator, 50)
+      assert [retry] = payload.retrying
+      assert retry.wait_reason == :authentication
+      assert retry.hold_reason == :authentication
+      assert retry.failed_attempts == 0
+      assert retry.due_at == nil
+    end
+
     test "legacy single-orchestrator path adds by_state, by_kind, and tokens_per_second" do
       started_at = DateTime.add(DateTime.utc_now(), -8, :second)
       log_events = Enum.map(1..25, fn i -> %{at: started_at, event: :tick, message: "e#{i}"} end)
@@ -115,6 +127,7 @@ defmodule CymphonyElixir.PresenterMetricsTest do
                running: 2,
                retrying: 1,
                waiting: 0,
+               completed: 0,
                by_state: %{"In Progress" => 1, "Todo" => 1},
                by_kind: %{"claude" => 1, "unknown" => 1}
              }
@@ -232,7 +245,7 @@ defmodule CymphonyElixir.PresenterMetricsTest do
 
       payload = Presenter.state_payload(orchestrator, 50)
 
-      assert payload.counts == %{running: 0, retrying: 0, waiting: 0, by_state: %{}, by_kind: %{}}
+      assert payload.counts == %{running: 0, retrying: 0, waiting: 0, completed: 0, by_state: %{}, by_kind: %{}}
 
       assert payload.token_totals == %{
                input_tokens: 0,

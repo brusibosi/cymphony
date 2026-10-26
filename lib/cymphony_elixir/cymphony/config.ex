@@ -518,17 +518,33 @@ defmodule CymphonyElixir.Cymphony.Config do
   end
 
   @agent_setting_keys ["agent", "model", "effort"]
+  @flat_agent_setting_keys ["claude_bare_mode", "max_retry_backoff_ms"]
 
   @doc """
   Merges agent settings (`"agent"`, `"model"`, `"effort"`) onto the named
   project (or all projects when `project_name` is nil) and saves. Keys absent
   from `settings` are untouched; empty-string values delete the key.
+
+  Two further flat per-project keys are supported and generated into the
+  native nested workflow (see `to_schema_map/1`):
+
+    * `"claude_bare_mode"` — boolean; `false` omits `--bare` from the Claude
+      command (`claude.bare_mode`). Absent means the default (`true`).
+    * `"max_retry_backoff_ms"` — positive integer; the failure-retry backoff cap
+      (`agent.max_retry_backoff_ms`). Absent means the schema default.
+
+  `nil` deletes either key. Any other value is rejected with
+  `{:error, :invalid_claude_bare_mode | :invalid_max_retry_backoff_ms}` before
+  `config.json` is read or written, so a bad value never replaces a valid one.
   """
   @spec update_agent_settings(String.t() | nil, map()) ::
-          :ok | {:error, :invalid_agent_kind | term()}
+          :ok
+          | {:error, :invalid_agent_kind | :invalid_claude_bare_mode | :invalid_max_retry_backoff_ms | term()}
   def update_agent_settings(project_name, settings) when is_map(settings) do
     with_write_lock(fn ->
       with :ok <- validate_agent_kind(Map.get(settings, "agent")),
+           :ok <- validate_claude_bare_mode(settings),
+           :ok <- validate_max_retry_backoff_ms(settings),
            {:ok, config} <- load(),
            {:ok, updated} <- apply_agent_settings(config, project_name, settings) do
         save(updated)
@@ -540,6 +556,23 @@ defmodule CymphonyElixir.Cymphony.Config do
 
   defp validate_agent_kind(kind) do
     if kind in Agent.known_kinds(), do: :ok, else: {:error, :invalid_agent_kind}
+  end
+
+  defp validate_claude_bare_mode(settings) do
+    case Map.fetch(settings, "claude_bare_mode") do
+      :error -> :ok
+      {:ok, value} when is_boolean(value) or is_nil(value) -> :ok
+      {:ok, _value} -> {:error, :invalid_claude_bare_mode}
+    end
+  end
+
+  defp validate_max_retry_backoff_ms(settings) do
+    case Map.fetch(settings, "max_retry_backoff_ms") do
+      :error -> :ok
+      {:ok, value} when is_nil(value) -> :ok
+      {:ok, value} when is_integer(value) and value > 0 -> :ok
+      {:ok, _value} -> {:error, :invalid_max_retry_backoff_ms}
+    end
   end
 
   defp apply_agent_settings(%{"projects" => projects} = config, project_name, settings)
@@ -561,11 +594,22 @@ defmodule CymphonyElixir.Cymphony.Config do
   end
 
   defp merge_agent_settings(map, settings) do
-    Enum.reduce(@agent_setting_keys, map, fn key, acc ->
+    string_merged =
+      Enum.reduce(@agent_setting_keys, map, fn key, acc ->
+        case Map.fetch(settings, key) do
+          {:ok, ""} -> Map.delete(acc, key)
+          {:ok, value} when is_binary(value) -> Map.put(acc, key, value)
+          _ -> acc
+        end
+      end)
+
+    # Already validated by `update_agent_settings/2`: a boolean/positive integer
+    # sets the key, `nil` returns it to absent.
+    Enum.reduce(@flat_agent_setting_keys, string_merged, fn key, acc ->
       case Map.fetch(settings, key) do
-        {:ok, ""} -> Map.delete(acc, key)
-        {:ok, value} when is_binary(value) -> Map.put(acc, key, value)
-        _ -> acc
+        {:ok, nil} -> Map.delete(acc, key)
+        {:ok, value} -> Map.put(acc, key, value)
+        :error -> acc
       end
     end)
   end
@@ -931,14 +975,16 @@ defmodule CymphonyElixir.Cymphony.Config do
       "workspace" => %{
         "root" => Map.get(config, "workspace_root", Defaults.workspace_root())
       },
-      "agent" => %{
-        "kind" => agent_kind(config),
-        "model" => Map.get(config, "model"),
-        "effort" => Map.get(config, "effort"),
-        "max_concurrent_agents" => Map.get(config, "max_concurrent_agents", Defaults.max_concurrent_agents()),
-        "max_turns" => Defaults.max_turns(),
-        "stall_timeout_ms" => stall_timeout_ms(config)
-      },
+      "agent" =>
+        %{
+          "kind" => agent_kind(config),
+          "model" => Map.get(config, "model"),
+          "effort" => Map.get(config, "effort"),
+          "max_concurrent_agents" => Map.get(config, "max_concurrent_agents", Defaults.max_concurrent_agents()),
+          "max_turns" => Defaults.max_turns(),
+          "stall_timeout_ms" => stall_timeout_ms(config)
+        }
+        |> maybe_put_max_retry_backoff_ms(config),
       "claude" => agent_section_map(config, "claude"),
       "codex" => agent_section_map(config, "codex"),
       "antigravity" => agent_section_map(config, "antigravity")
@@ -964,8 +1010,40 @@ defmodule CymphonyElixir.Cymphony.Config do
     end
   end
 
+  # Only a positive integer is honored, and only when present: an absent key
+  # keeps the schema default (the generated file stays byte-compatible), while
+  # a stored `0`, negative number, float or string is logged and ignored rather
+  # than generating a front-matter value that fails `Schema.parse/1` or removes
+  # the backoff cap.
+  defp maybe_put_max_retry_backoff_ms(section, config) do
+    case Map.fetch(config, "max_retry_backoff_ms") do
+      :error -> section
+      {:ok, nil} -> section
+      {:ok, value} when is_integer(value) and value > 0 -> Map.put(section, "max_retry_backoff_ms", value)
+      {:ok, value} -> warn_ignored_setting("max_retry_backoff_ms", "a positive integer", value, section)
+    end
+  end
+
+  # `--bare` is on by default in the adapter, so absence must stay absent; an
+  # explicit boolean (including `false`) is passed through. Anything else is
+  # logged and ignored rather than silently flipping the flag.
+  defp maybe_put_bare_mode(section, config) do
+    case Map.fetch(config, "claude_bare_mode") do
+      :error -> section
+      {:ok, nil} -> section
+      {:ok, value} when is_boolean(value) -> Map.put(section, "bare_mode", value)
+      {:ok, value} -> warn_ignored_setting("claude_bare_mode", "a boolean", value, section)
+    end
+  end
+
+  defp warn_ignored_setting(key, expected, value, section) do
+    Logger.warning("Ignoring invalid #{key} in config.json: expected #{expected}, got #{inspect(value)}")
+    section
+  end
+
   defp agent_section_map(config, "claude") do
     %{"command" => Defaults.claude_command(), "output_format" => Defaults.output_format()}
+    |> maybe_put_bare_mode(config)
     |> maybe_put_provider_keys(config, "claude")
     |> maybe_put_extra_args(config, "claude")
   end

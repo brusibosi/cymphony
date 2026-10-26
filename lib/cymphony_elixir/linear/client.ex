@@ -4,7 +4,8 @@ defmodule CymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias CymphonyElixir.{Config, Linear.Issue}
+  alias CymphonyElixir.Config
+  alias CymphonyElixir.Linear.{Issue, RateLimit}
 
   @issue_page_size 50
   @project_page_size 50
@@ -23,6 +24,7 @@ defmodule CymphonyElixir.Linear.Client do
         priority
         state {
           name
+          type
         }
         branchName
         url
@@ -68,6 +70,7 @@ defmodule CymphonyElixir.Linear.Client do
         priority
         state {
           name
+          type
         }
         branchName
         url
@@ -105,6 +108,10 @@ defmodule CymphonyElixir.Linear.Client do
     }
   }
   """
+
+  @query_by_ids_project @query_by_ids
+                        |> String.replace("($ids:", "($projectSlug: String!, $ids:")
+                        |> String.replace("filter: {id: {in: $ids}}", "filter: {id: {in: $ids}, project: {slugId: {eq: $projectSlug}}}")
 
   @projects_query """
   query CymphonyLinearProjects($first: Int!, $after: String) {
@@ -223,35 +230,64 @@ defmodule CymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        with {:ok, assignee_filter} <- routing_assignee_filter(config) do
-          do_fetch_issue_states(ids, assignee_filter, config_graphql_fun(config))
+        with :ok <- require_project_slug(config.tracker.project_slug),
+             {:ok, assignee_filter} <- routing_assignee_filter(config) do
+          do_fetch_issue_states(ids, assignee_filter, config_graphql_fun(config), config.tracker.project_slug)
         end
     end
   end
+
+  defp require_project_slug(slug) when is_binary(slug) and byte_size(slug) > 0, do: :ok
+  defp require_project_slug(_slug), do: {:error, :missing_linear_project_slug}
 
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
-    request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
     headers_fun = Keyword.get(opts, :graphql_headers_fun, &graphql_headers/0)
+    endpoint = graphql_endpoint(opts)
 
     with {:ok, headers} <- headers_fun.(),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
+         :ok <- RateLimit.check(endpoint, headers, opts) do
+      execute_graphql(payload, headers, endpoint, opts)
     else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
-
-        {:error, {:linear_api_status, response.status}}
+      {:error, {:linear_rate_limited, _until_ms}} = limited ->
+        limited
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
     end
+  end
+
+  defp execute_graphql(payload, headers, endpoint, opts) do
+    request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
+
+    case request_fun.(payload, headers) do
+      {:ok, %{status: 200, body: body} = response} ->
+        case RateLimit.observe(endpoint, headers, response, opts) do
+          :ok -> {:ok, body}
+          limited -> limited
+        end
+
+      {:ok, response} ->
+        RateLimit.observe(endpoint, headers, response, opts)
+        context = RateLimit.redact(linear_error_context(payload, response, headers), headers)
+        Logger.error("Linear GraphQL request failed status=#{response.status}" <> context)
+        {:error, {:linear_api_status, response.status}}
+
+      {:error, reason} ->
+        Logger.error("Linear GraphQL request failed: " <> RateLimit.redact(inspect(reason, printable_limit: :infinity), headers))
+        {:error, {:linear_api_request, reason}}
+    end
+  end
+
+  defp graphql_endpoint(opts) do
+    Keyword.get_lazy(opts, :endpoint, fn ->
+      if Keyword.has_key?(opts, :request_fun),
+        do: @default_linear_graphql_endpoint,
+        else: Config.settings!().tracker.endpoint
+    end)
   end
 
   @doc """
@@ -413,31 +449,30 @@ defmodule CymphonyElixir.Linear.Client do
     do_fetch_issue_states(ids, assignee_filter, &graphql/2)
   end
 
-  defp do_fetch_issue_states(ids, assignee_filter, graphql_fun)
+  defp do_fetch_issue_states(ids, assignee_filter, graphql_fun, project_slug \\ nil)
        when is_list(ids) and is_function(graphql_fun, 2) do
     issue_order_index = issue_order_index(ids)
-    do_fetch_issue_states_page(ids, assignee_filter, graphql_fun, [], issue_order_index)
+    fetch_states_page(ids, assignee_filter, graphql_fun, [], issue_order_index, project_slug)
   end
 
-  defp do_fetch_issue_states_page([], _assignee_filter, _graphql_fun, acc_issues, issue_order_index) do
+  defp fetch_states_page([], _assignee_filter, _graphql_fun, acc_issues, issue_order_index, _project_slug) do
     acc_issues
     |> finalize_paginated_issues()
     |> sort_issues_by_requested_ids(issue_order_index)
     |> then(&{:ok, &1})
   end
 
-  defp do_fetch_issue_states_page(ids, assignee_filter, graphql_fun, acc_issues, issue_order_index) do
+  defp fetch_states_page(ids, assignee_filter, graphql_fun, acc_issues, issue_order_index, project_slug) do
     {batch_ids, rest_ids} = Enum.split(ids, @issue_page_size)
+    query = if is_binary(project_slug), do: @query_by_ids_project, else: @query_by_ids
+    variables = %{ids: batch_ids, first: length(batch_ids), relationFirst: @issue_page_size}
+    variables = if is_binary(project_slug), do: Map.put(variables, :projectSlug, project_slug), else: variables
 
-    case graphql_fun.(@query_by_ids, %{
-           ids: batch_ids,
-           first: length(batch_ids),
-           relationFirst: @issue_page_size
-         }) do
+    case graphql_fun.(query, variables) do
       {:ok, body} ->
         with {:ok, issues} <- decode_linear_response(body, assignee_filter) do
           updated_acc = prepend_page_issues(issues, acc_issues)
-          do_fetch_issue_states_page(rest_ids, assignee_filter, graphql_fun, updated_acc, issue_order_index)
+          fetch_states_page(rest_ids, assignee_filter, graphql_fun, updated_acc, issue_order_index, project_slug)
         end
 
       {:error, reason} ->
@@ -481,7 +516,7 @@ defmodule CymphonyElixir.Linear.Client do
 
   defp maybe_put_operation_name(payload, _operation_name), do: payload
 
-  defp linear_error_context(payload, response) when is_map(payload) do
+  defp linear_error_context(payload, response, headers) when is_map(payload) do
     operation_name =
       case Map.get(payload, "operationName") do
         name when is_binary(name) and name != "" -> " operation=#{name}"
@@ -491,22 +526,24 @@ defmodule CymphonyElixir.Linear.Client do
     body =
       response
       |> Map.get(:body)
-      |> summarize_error_body()
+      |> summarize_error_body(headers)
 
     operation_name <> " body=" <> body
   end
 
-  defp summarize_error_body(body) when is_binary(body) do
+  defp summarize_error_body(body, headers) when is_binary(body) do
     body
+    |> RateLimit.redact(headers)
     |> String.replace(Regex.compile!("\\s+"), " ")
     |> String.trim()
     |> truncate_error_body()
     |> inspect()
   end
 
-  defp summarize_error_body(body) do
+  defp summarize_error_body(body, headers) do
     body
-    |> inspect(limit: 20, printable_limit: @max_error_body_log_bytes)
+    |> inspect(limit: 20, printable_limit: :infinity)
+    |> RateLimit.redact(headers)
     |> truncate_error_body()
   end
 
@@ -548,6 +585,7 @@ defmodule CymphonyElixir.Linear.Client do
 
   defp post_graphql_request(payload, headers) do
     Req.post(Config.settings!().tracker.endpoint,
+      retry: false,
       headers: headers,
       json: payload,
       connect_options: [timeout: 30_000]
@@ -556,6 +594,7 @@ defmodule CymphonyElixir.Linear.Client do
 
   defp post_graphql_request(payload, headers, config) when is_struct(config, Config.Schema) do
     Req.post(config.tracker.endpoint,
+      retry: false,
       headers: headers,
       json: payload,
       connect_options: [timeout: 30_000]
@@ -564,6 +603,7 @@ defmodule CymphonyElixir.Linear.Client do
 
   defp post_graphql_request_to(endpoint, payload, headers) do
     Req.post(endpoint,
+      retry: false,
       headers: headers,
       json: payload,
       connect_options: [timeout: 30_000]
@@ -575,10 +615,17 @@ defmodule CymphonyElixir.Linear.Client do
   def graphql_opts_for_config(nil), do: []
 
   def graphql_opts_for_config(config) when is_struct(config, Config.Schema) do
+    app_opts = Application.get_env(:cymphony_elixir, :linear_graphql_opts, [])
+    app_opts = if Keyword.keyword?(app_opts), do: app_opts, else: []
+
     [
+      endpoint: config.tracker.endpoint,
+      rate_limit_fallback_ms: min(10_000, config.agent.max_retry_backoff_ms),
       request_fun: fn payload, headers -> post_graphql_request(payload, headers, config) end,
       graphql_headers_fun: fn -> graphql_headers(config) end
     ]
+    |> Keyword.merge(app_opts)
+    |> Keyword.put(:endpoint, config.tracker.endpoint)
   end
 
   defp config_graphql_fun(config) do
@@ -812,6 +859,7 @@ defmodule CymphonyElixir.Linear.Client do
       description: issue["description"],
       priority: parse_priority(issue["priority"]),
       state: get_in(issue, ["state", "name"]),
+      state_type: get_in(issue, ["state", "type"]),
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),

@@ -1888,7 +1888,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     assigns = view_assigns(view)
     assert assigns.payload_error == %{code: "snapshot_timeout", message: "Snapshot timed out"}
-    assert assigns.counts == %{running: 0, retrying: 0, waiting: 0, by_state: %{}, by_kind: %{}}
+    assert assigns.counts == %{running: 0, retrying: 0, waiting: 0, completed: 0, by_state: %{}, by_kind: %{}}
     assert assigns.token_totals == %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     assert assigns.rate_limits == nil
     assert assigns.polling == nil
@@ -2219,13 +2219,13 @@ defmodule CymphonyElixir.DashboardLiveTest do
     :erlang.trace(view.pid, false, [:send])
 
     # A real retry update still lands, including its fresh clock anchor.
-    retrying = %{retrying | attempt: 3}
+    retrying = %{retrying | attempt: 3, failed_attempts: 3}
     projects = Enum.map(projects, &%{&1 | retrying: [retrying]})
     changed = %{drifted | projects: projects, retrying: [retrying]}
     send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, changed))
     render(view)
     assert DateTime.compare(view_assigns(view).now, now_before) == :gt
-    assert has_element?(view, ".retry-row .chip--warn", "Attempt 3")
+    assert has_element?(view, ".retry-row .chip--warn", "Failed starts 3")
   end
 
   for queue_size <- [3, 100] do

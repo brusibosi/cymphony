@@ -12,7 +12,7 @@ defmodule CymphonyElixir.Agent.Runner do
   require Logger
 
   alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text, Workspace}
-  alias CymphonyElixir.Agent.{OutputWindow, PortGuard}
+  alias CymphonyElixir.Agent.{OutputWindow, PortGuard, ProviderFailure}
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
@@ -421,7 +421,7 @@ defmodule CymphonyElixir.Agent.Runner do
           {:ok, line} ->
             log_stream_line(line)
             emit_harness_stdout(on_message, line)
-            collect_output(port, "", OutputWindow.push(window, line), config, on_message, eof?, guard_ref)
+            collect_output(port, "", retain_output_line(window, line), config, on_message, eof?, guard_ref)
 
           {:error, _} = error ->
             stop_port(port)
@@ -467,7 +467,7 @@ defmodule CymphonyElixir.Agent.Runner do
           {:ok, line} ->
             log_stream_line(line)
             emit_harness_stdout(on_message, line)
-            drain_port_until_eof(port, "", OutputWindow.push(window, line), on_message)
+            drain_port_until_eof(port, "", retain_output_line(window, line), on_message)
 
           {:error, _} = error ->
             stop_port(port)
@@ -502,22 +502,29 @@ defmodule CymphonyElixir.Agent.Runner do
     end
   end
 
-  defp finalize_collected_output(0, buffer, window, on_message) do
+  defp finalize_collected_output(status, buffer, window, on_message) do
     remaining = buffer |> to_string() |> String.trim()
 
     if remaining != "" do
       log_stream_line(remaining)
-      emit_harness_stdout(on_message, remaining)
+      if status == 0, do: emit_harness_stdout(on_message, remaining)
     end
 
-    window = if remaining != "", do: OutputWindow.push(window, remaining), else: window
-    {:ok, OutputWindow.lines(window)}
+    window = if remaining != "", do: retain_output_line(window, remaining), else: window
+    lines = OutputWindow.lines(window)
+
+    # Classify actual CLI envelopes before redaction/truncation destroys their
+    # machine-readable error codes. Exit zero can still be a semantic refusal.
+    case Map.get(window, :provider_failure) do
+      %ProviderFailure{} = failure -> {:error, failure}
+      nil when status == 0 -> {:ok, lines}
+      nil -> {:error, {:agent_exit, status, failure_tail(window, "")}}
+    end
   end
 
-  defp finalize_collected_output(status, buffer, window, _on_message) do
-    remaining = buffer |> to_string() |> String.trim()
-    if remaining != "", do: log_stream_line(remaining)
-    {:error, {:agent_exit, status, failure_tail(window, remaining)}}
+  defp retain_output_line(window, line) do
+    failure = ProviderFailure.observe(Map.get(window, :provider_failure), line, System.system_time(:millisecond))
+    window |> OutputWindow.push(line) |> Map.put(:provider_failure, failure)
   end
 
   # A CLI that rejects its arguments prints a complete, newline-terminated

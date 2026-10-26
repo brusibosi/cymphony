@@ -32,7 +32,7 @@ defmodule CymphonyElixirWeb.Presenter do
 
         %{
           generated_at: generated_at,
-          counts: payload_counts(flat_running, flat_retrying, flat_waiting),
+          counts: payload_counts(flat_running, flat_retrying, flat_waiting, Enum.sum(Enum.map(projects, & &1.completed_count))),
           running: flat_running,
           retrying: flat_retrying,
           recent_completed: Enum.map(merged.recent_completed, &completed_entry_payload/1),
@@ -347,6 +347,9 @@ defmodule CymphonyElixirWeb.Presenter do
       issue_url: issue_field(entry, :url),
       priority: issue_field(entry, :priority),
       attempt: entry.attempt,
+      failed_attempts: Map.get(entry, :failed_attempts, entry.attempt),
+      wait_reason: Map.get(entry, :wait_reason),
+      hold_reason: Map.get(entry, :hold_reason),
       held: held?(entry),
       due_at: due_at_iso8601(entry),
       error: entry.error,
@@ -417,6 +420,7 @@ defmodule CymphonyElixirWeb.Presenter do
       running_count: length(running),
       retrying_count: length(retrying),
       waiting_count: length(waiting),
+      completed_count: Map.get(snapshot, :completed_count, 0),
       providers: Map.get(snapshot, :providers, []),
       agent_kind: Map.get(snapshot, :agent_kind),
       agent_model: Map.get(snapshot, :agent_model),
@@ -456,6 +460,9 @@ defmodule CymphonyElixirWeb.Presenter do
   defp retry_issue_payload(retry) do
     %{
       attempt: retry.attempt,
+      failed_attempts: Map.get(retry, :failed_attempts, retry.attempt),
+      wait_reason: Map.get(retry, :wait_reason),
+      hold_reason: Map.get(retry, :hold_reason),
       held: held?(retry),
       due_at: due_at_iso8601(retry),
       error: retry.error,
@@ -563,7 +570,7 @@ defmodule CymphonyElixirWeb.Presenter do
 
     %{
       generated_at: generated_at,
-      counts: payload_counts(running, retrying, project.waiting),
+      counts: payload_counts(running, retrying, project.waiting, project.completed_count),
       running: running,
       retrying: retrying,
       recent_completed:
@@ -745,13 +752,14 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  defp payload_counts(running, retrying, waiting) do
+  defp payload_counts(running, retrying, waiting, completed_count \\ 0) do
     breakdowns = count_breakdowns(running)
 
     %{
       running: length(running),
       retrying: length(retrying),
       waiting: length(waiting),
+      completed: completed_count,
       by_state: breakdowns.by_state,
       by_kind: breakdowns.by_kind
     }

@@ -16,6 +16,14 @@ These are the supported kinds returned by `CymphonyElixir.Agent.known_kinds/0`: 
 
 **Release status (2026-09-25):** This README describes current `main`. The latest published package is v2.8.2 (2026-08-18); it predates the unreleased hardening and behavior documented here, although `main` still reports version `2.8.2`. Build from source for current-`main` behavior; do not assume the published v2.8.2 binaries include it.
 
+## Retry safety and project-run counts
+
+Retries check dispatch capacity before contacting Linear and refresh the exact project-scoped issue instead of scanning the project. Linear 429 and explicit GraphQL rate-limit responses establish a shared endpoint/credential cooldown; requests already in flight may finish. Recognized provider login/quota refusals are actionable holds, not repeated coding failures. A known quota reset can resume work automatically; an unknown reset or invalid login needs corrective action and **Retry now**. Manual retry does not bypass Linear cooldowns.
+
+The dashboard/API `counts.completed` and each project's `completed_count` count distinct tracker-confirmed completed tickets in the current run, without a 100-ticket cap. Pause followed by Resume starts a new project run and resets only that project's counter; repeated Resume while running and browser/worker refreshes do not. Fresh project runtime startup also starts at zero. Canceled/duplicate issues, failed workers and active continuation turns are not completed tickets. The bounded recent agent-run history is separate and remains durable across restarts.
+
+Tests use a private completion database under the test build's `tmp/test-logs` directory; they do not append synthetic sessions to the operator's history.
+
 ## What it does
 
 - Watches one or many Linear projects in one daemon.
@@ -267,6 +275,7 @@ For local sessions with a Linear key, Cymphony offers the `cymphony-linear` MCP 
 - An agent failure retries after exponential backoff starting at 10 seconds, capped by `agent.max_retry_backoff_ms` (default 300 seconds). A continuation retry uses a 1-second delay.
 - The stall watchdog defaults to 5 minutes of agent-event silence and is configurable per project with positive `agent.stall_timeout_ms`.
 - In `config.json`, `stall_timeout_ms` is a positive-integer project key; invalid/nonpositive values fall back to 5 minutes. Operator-authored `extra_args` can be a string list or a map of per-kind string lists, and only the active kind is emitted into generated workflow front matter. Antigravity defaults to `--new-project` and writes its CLI log beside the workspace; only an explicit project `new_project: false` removes that flag.
+- Per-project `config.json` keys `claude_bare_mode` (boolean, absent = `true`/`--bare`; `false` drops `--bare`) and `max_retry_backoff_ms` (positive integer, absent = 300000) are generated into `claude.bare_mode` and `agent.max_retry_backoff_ms`; they persist across saves and workflow regeneration. Invalid saved values are rejected by `Config.update_agent_settings/2`.
 - Genuine consecutive failures count toward `agent.max_retry_attempts` (default 30). Once that budget is exceeded, Cymphony posts a bounded/redacted error comment, optionally changes state, and removes the workspace. A pause-held retry keeps its attempt/failure count; an explicit manual retry remains available while paused.
 - Terminal or non-active issues stop running agents. Terminal cleanup runs `before_remove` before deletion. Manual kill stops the session without deleting the workspace.
 - Workspace and harness output is streamed into bounded buffers; recognized secrets are redacted from public event state, harness views, and failure excerpts. This is not a general secret scanner: unnamed values without a known pattern may pass through. A single unterminated CLI line above 256 KiB is rejected; the Antigravity fallback text window is capped at 64 KiB with a truncation marker. The host-local debug log is deliberately raw.

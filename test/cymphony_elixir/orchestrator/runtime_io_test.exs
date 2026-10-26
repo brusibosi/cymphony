@@ -393,10 +393,8 @@ defmodule CymphonyElixir.Orchestrator.RuntimeIOTest do
   end
 
   test "manual retry tracker lookup is responsive and remains owned during lookup", %{root: root} do
-    {endpoint, _server} = endpoint(:poll)
+    {endpoint, _server} = endpoint(:by_id)
     {_name, orchestrator} = start_project(root, tracker_endpoint: endpoint)
-    assert_receive {:request, :poll, initial}, 2_000
-    send(initial, {:release, []})
     eventually(fn -> not Orchestrator.snapshot(orchestrator, 100).polling.checking? end)
     token = make_ref()
 
@@ -420,7 +418,7 @@ defmodule CymphonyElixir.Orchestrator.RuntimeIOTest do
     end)
 
     assert :ok = GenServer.call(orchestrator, {:retry_issue_now, "owned-1"}, 100)
-    assert_receive {:request, :poll, request}, 2_000
+    assert_receive {:request, :by_id, request}, 2_000
     assert [%{issue_id: "owned-1", attempt: 2}] = Orchestrator.snapshot(orchestrator, 100).retrying
     assert :ok = GenServer.call(orchestrator, :resume, 100)
     send(request, {:release, []})
