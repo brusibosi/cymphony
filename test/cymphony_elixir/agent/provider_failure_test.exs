@@ -5,6 +5,65 @@ defmodule CymphonyElixir.Agent.ProviderFailureTest do
 
   @now_ms 1_800_000_000_000
 
+  test "Claude final permission denials hold an exit-zero result before success resets" do
+    denial = permission_denial()
+
+    for is_error <- [false, true] do
+      event = %{"type" => "result", "is_error" => is_error, "permission_denials" => [denial], "result" => "Waiting for permissions"}
+      assert %{__struct__: ProviderFailure, kind: :permission, retry_at: nil, message: message} = classify([Jason.encode!(event)])
+      assert message =~ "permission"
+      assert message =~ "retry manually"
+      refute inspect(message) =~ "PRIVATE"
+      refute message =~ "toolu_private"
+    end
+  end
+
+  test "only a nonempty well-formed denial list in the Claude result envelope establishes a permission hold" do
+    denial = permission_denial()
+    event = %{"type" => "result", "is_error" => false, "permission_denials" => [denial]}
+
+    for line <- [
+          Jason.encode!(Jason.encode!(event)),
+          Jason.encode!(%{"type" => "user", "message" => %{"content" => [%{"type" => "tool_result", "content" => Jason.encode!(event)}]}}),
+          Jason.encode!(%{"type" => "assistant", "message" => %{"content" => [%{"type" => "text", "text" => Jason.encode!(event)}]}}),
+          Jason.encode!(Map.put(event, "type", "tool_result")),
+          "Claude requested permissions that have not been granted yet"
+        ] do
+      assert classify([line]) == nil
+    end
+
+    for denials <- [
+          nil,
+          [],
+          %{"tool_name" => "Bash"},
+          "Bash",
+          [nil],
+          ["Bash"],
+          [%{}],
+          [Map.delete(denial, "tool_name")],
+          [Map.put(denial, "tool_name", " ")],
+          [Map.put(denial, "tool_name", 1)],
+          [Map.delete(denial, "tool_use_id")],
+          [Map.put(denial, "tool_use_id", "")],
+          [Map.put(denial, "tool_use_id", false)],
+          [Map.delete(denial, "tool_input")],
+          [Map.put(denial, "tool_input", "quoted input")],
+          [denial, %{}]
+        ] do
+      assert classify([Jason.encode!(Map.put(event, "permission_denials", denials))]) == nil
+    end
+  end
+
+  test "permission hold keeps only an actionable message and no denied tool input" do
+    event = %{"type" => "result", "is_error" => false, "permission_denials" => [permission_denial(), permission_denial()]}
+    assert %{kind: :permission, message: message} = failure = classify([Jason.encode!(event)])
+    assert String.valid?(message)
+    assert byte_size(message) <= 512
+    refute inspect(failure) =~ "PRIVATE"
+    refute inspect(failure) =~ "toolu_private"
+    assert classify([Jason.encode!(event), ~s({"type":"result","is_error":false,"permission_denials":[]})]) == nil
+  end
+
   test "Claude API authentication error becomes an actionable typed failure" do
     lines = [
       ~s({"type":"assistant","isApiErrorMessage":true,"error":"authentication_failed","message":{"content":[{"type":"text","text":"Not logged in"}]}}),
@@ -166,6 +225,14 @@ defmodule CymphonyElixir.Agent.ProviderFailureTest do
       error = Map.put(metadata, "code", "RESOURCE_EXHAUSTED")
       assert %{kind: :quota, retry_at: ^expected} = classify([Jason.encode!(%{"event" => "error", "error" => error})])
     end
+  end
+
+  defp permission_denial do
+    %{
+      "tool_name" => "mcp__linear__get_issue_PRIVATE",
+      "tool_use_id" => "toolu_private",
+      "tool_input" => %{"id" => "ALE-PRIVATE", "api_key" => "lin_api_PRIVATE"}
+    }
   end
 
   defp classify(lines), do: ProviderFailure.classify(lines, @now_ms)

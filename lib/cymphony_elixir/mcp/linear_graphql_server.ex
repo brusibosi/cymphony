@@ -2,7 +2,7 @@ defmodule CymphonyElixir.Mcp.LinearGraphqlServer do
   @moduledoc """
   Pure request/response logic for the `linear_graphql` MCP tool.
 
-  The stdio loop lives in `Mix.Tasks.Cymphony.Mcp.LinearGraphql` and calls
+  The stdio loop lives in `CymphonyElixir.Mcp.Stdio` and calls
   `handle_message/2` per frame; everything in this module is side-effect-free
   apart from the injected `graphql_fun`, which makes the handler trivially
   testable.
@@ -166,14 +166,7 @@ defmodule CymphonyElixir.Mcp.LinearGraphqlServer do
   end
 
   defp build_graphql_opts(api_key, endpoint) when is_binary(api_key) and api_key != "" do
-    headers = [{"Authorization", api_key}, {"Content-Type", "application/json"}]
-
-    base_opts = [graphql_headers_fun: fn -> {:ok, headers} end]
-
-    case endpoint do
-      e when is_binary(e) and e != "" -> Keyword.put(base_opts, :endpoint, e)
-      _ -> base_opts
-    end
+    Client.graphql_opts_for_api_key(api_key, endpoint: endpoint)
   end
 
   defp build_graphql_opts(_api_key, _endpoint), do: []

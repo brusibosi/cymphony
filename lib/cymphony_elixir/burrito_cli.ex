@@ -14,13 +14,18 @@ defmodule CymphonyElixir.BurritoCLI do
 
   @impl true
   def start(_type, _args) do
-    :ok = CymphonyElixir.LogFile.configure()
-    children = CymphonyApplication.children()
+    args = Args.argv()
+
+    children =
+      if args == ["mcp", "linear-graphql"] do
+        []
+      else
+        :ok = CymphonyElixir.LogFile.configure()
+        CymphonyApplication.children()
+      end
 
     with {:ok, sup_pid} <-
            Supervisor.start_link(children, strategy: :one_for_one, name: CymphonyElixir.Supervisor) do
-      args = Args.argv()
-
       Task.start(__MODULE__, :run_cli, [args])
 
       {:ok, sup_pid}

@@ -1,9 +1,13 @@
 defmodule CymphonyElixir.Cymphony.ConfigTest do
   use ExUnit.Case, async: true
 
+  alias CymphonyElixir.Agent
+  alias CymphonyElixir.Agent.Claude
   alias CymphonyElixir.Config.Schema
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.WorkflowGenerator
+  alias CymphonyElixir.Linear.Issue
+  alias CymphonyElixir.RunSpecResolver
   alias CymphonyElixir.Workflow
 
   describe "normalize/1" do
@@ -247,7 +251,7 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
   end
 
   describe "to_schema_map/1 extra_args" do
-    test "a map keyed by kind emits only the active kind's list" do
+    test "a map keyed by kind retains each list in its own agent section" do
       config = %{
         "agent" => "antigravity",
         "extra_args" => %{"antigravity" => ["--new-project"], "codex" => ["--full-auto"]}
@@ -256,14 +260,14 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       schema_map = CymphonyConfig.to_schema_map(config)
 
       assert schema_map["antigravity"]["extra_args"] == ["--new-project"]
-      refute Map.has_key?(schema_map["codex"], "extra_args")
+      assert schema_map["codex"]["extra_args"] == ["--full-auto"]
       refute Map.has_key?(schema_map["claude"], "extra_args")
       assert {:ok, %Schema{} = parsed} = Schema.parse(schema_map)
       assert parsed.antigravity.extra_args == ["--new-project"]
-      assert parsed.codex.extra_args == nil
+      assert parsed.codex.extra_args == ["--full-auto"]
     end
 
-    test "switching the active kind switches which list is emitted" do
+    test "switching the default agent does not discard other agents' explicit lists" do
       config = %{
         "agent" => "codex",
         "extra_args" => %{"antigravity" => ["--new-project"], "codex" => ["--full-auto"]}
@@ -273,10 +277,42 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
 
       # A project pinned to codex must never inherit the antigravity flags.
       assert schema_map["codex"]["extra_args"] == ["--full-auto"]
-      refute Map.has_key?(schema_map["antigravity"], "extra_args")
+      assert schema_map["antigravity"]["extra_args"] == ["--new-project"]
       assert {:ok, %Schema{} = parsed} = Schema.parse(schema_map)
       assert parsed.codex.extra_args == ["--full-auto"]
-      assert parsed.antigravity.extra_args == nil
+      assert parsed.antigravity.extra_args == ["--new-project"]
+    end
+
+    test "a Claude issue override keeps its Linear permission flags on a Codex-default project" do
+      config = %{
+        "agent" => "codex",
+        "claude_bare_mode" => false,
+        "extra_args" => %{
+          "codex" => ["--codex-only-flag"],
+          "claude" => ["--allowedTools", "mcp__claude_ai_Linear__*"]
+        }
+      }
+
+      assert {:ok, parsed} = config |> CymphonyConfig.to_schema_map() |> Schema.parse()
+      issue = %Issue{labels: ["agent:claude"]}
+      spec = RunSpecResolver.resolve(issue, parsed)
+      assert spec.agent_kind == "claude"
+
+      assert {:ok, command} =
+               Claude.build_command(%{
+                 settings: Agent.section(parsed, spec.agent_kind),
+                 command: nil,
+                 prompt: "Read the assigned Linear issue",
+                 model: spec.model,
+                 effort: spec.effort,
+                 session_id: nil,
+                 mcp_descriptor: nil,
+                 workspace: System.tmp_dir!()
+               })
+
+      assert command =~ "mcp__claude_ai_Linear__*"
+      refute command =~ "--codex-only-flag"
+      refute command =~ "--bare"
     end
 
     test "a map with no entry for the active kind emits nothing and stays quiet" do

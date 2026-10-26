@@ -7,6 +7,7 @@ defmodule CymphonyElixir.CLI do
   alias CymphonyElixir.Daemon
   alias CymphonyElixir.LegacySupervisor
   alias CymphonyElixir.LogFile
+  alias CymphonyElixir.Mcp.Stdio
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.Onboarding
@@ -95,6 +96,10 @@ defmodule CymphonyElixir.CLI do
 
   defp dispatch_evaluate(args, deps) do
     cond do
+      args == ["mcp", "linear-graphql"] ->
+        :ok = Stdio.run()
+        :done
+
       help_requested?(args) ->
         {:error, help_text()}
 

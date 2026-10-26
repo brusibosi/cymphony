@@ -9,6 +9,8 @@ defmodule CymphonyElixir.Agent.Codex do
 
   @behaviour CymphonyElixir.Agent
 
+  alias CymphonyElixir.Mcp.Command
+
   @mcp_server_name "cymphony-linear"
 
   @impl true
@@ -145,10 +147,11 @@ defmodule CymphonyElixir.Agent.Codex do
        when is_binary(key) and key != "" do
     endpoint = Map.get(descriptor, :endpoint) || "https://api.linear.app/graphql"
     prefix = "mcp_servers.#{@mcp_server_name}"
+    {command, command_args} = Command.build()
 
     args
-    |> add_config_override("#{prefix}.command", toml_string("elixir"))
-    |> add_config_override("#{prefix}.args", ~s(["-S", "mix", "cymphony.mcp.linear_graphql"]))
+    |> add_config_override("#{prefix}.command", toml_string(command))
+    |> add_config_override("#{prefix}.args", Jason.encode!(command_args))
     |> add_config_override("#{prefix}.env", "{LINEAR_ENDPOINT = " <> toml_string(endpoint) <> "}")
     |> add_config_override("#{prefix}.env_vars", ~s(["LINEAR_API_KEY"]))
   end
@@ -163,7 +166,7 @@ defmodule CymphonyElixir.Agent.Codex do
   defp add_config_override(args, key, toml_value),
     do: args ++ ["-c", shell_escape("#{key}=#{toml_value}")]
 
-  defp toml_string(value), do: "\"#{value}\""
+  defp toml_string(value), do: Jason.encode!(value)
 
   defp emit(on_message, details) when is_function(on_message, 1) do
     on_message.(Map.put(details, :timestamp, DateTime.utc_now()))
