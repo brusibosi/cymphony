@@ -777,8 +777,30 @@ defmodule CymphonyElixir.Orchestrator do
       else: release_skipped_retry(state, ctx.issue, ctx.attempt)
   end
 
-  defp apply_intent_result(state, ctx, {:skip, skipped}) do
-    state = state |> complete_terminal_tool_issue(skipped) |> confirm_completed_issue(skipped)
+  defp apply_intent_result(state, %{source: :retry} = ctx, {:skip, %Issue{} = issue}) do
+    case state.retry_attempts[ctx.issue.id] do
+      %{hold_reason: :tool_permission} = retry ->
+        case resolve_tool_issue_outcome(state, issue, retry[:completion_entry], ctx.attempt, ctx.metadata) do
+          {:resolved, resolved} -> resolved
+          :unresolved -> reschedule_failed_retry_refresh(state, ctx.issue, ctx.attempt, :issue_state_unresolved)
+        end
+
+      _ ->
+        apply_skipped_intent_result(state, ctx, issue)
+    end
+  end
+
+  defp apply_intent_result(state, ctx, {:skip, skipped}), do: apply_skipped_intent_result(state, ctx, skipped)
+
+  defp apply_intent_result(state, ctx, {:error, reason}) do
+    reschedule_failed_retry_refresh(state, ctx.issue, ctx.attempt, reason)
+  end
+
+  defp apply_skipped_intent_result(state, ctx, skipped) do
+    state =
+      if is_struct(skipped, Issue) and terminal_issue_state?(skipped.state, terminal_state_set(state)),
+        do: confirm_completed_issue(state, skipped),
+        else: state
 
     state =
       if ctx.source == :retry and is_struct(skipped, Issue) and
@@ -790,10 +812,6 @@ defmodule CymphonyElixir.Orchestrator do
 
     state = %{state | waiting: Enum.reject(state.waiting, &(&1.id == ctx.issue.id))}
     release_skipped_retry(state, ctx.issue, ctx.attempt)
-  end
-
-  defp apply_intent_result(state, ctx, {:error, reason}) do
-    reschedule_failed_retry_refresh(state, ctx.issue, ctx.attempt, reason)
   end
 
   defp queue_effect(state, key, work) do
@@ -2064,14 +2082,9 @@ defmodule CymphonyElixir.Orchestrator do
   defp finish_tool_permission_check(state, ctx, {:ok, issues}) do
     issue = Enum.find(issues, &(&1.id == ctx.entry.issue.id))
 
-    if issue != nil and terminal_issue_state?(issue.state, terminal_state_set(state)) do
-      state
-      |> complete_issue(issue.id, ctx.entry)
-      |> confirm_completed_issue(issue)
-      |> release_retry_claim(issue.id)
-      |> queue_issue_cleanup(issue.id, issue.identifier, ctx.entry[:worker_host])
-    else
-      park_tool_permission(state, ctx)
+    case resolve_tool_issue_outcome(state, issue, ctx.entry, ctx.attempt, ctx.metadata) do
+      {:resolved, resolved} -> resolved
+      :unresolved -> park_tool_permission(state, ctx)
     end
   end
 
@@ -2090,29 +2103,35 @@ defmodule CymphonyElixir.Orchestrator do
     for {id, %{hold_reason: :tool_permission, retry_token: token}} <- state.retry_attempts, into: %{}, do: {id, token}
   end
 
-  defp complete_terminal_tool_issue(state, %Issue{} = issue) do
-    case state.retry_attempts[issue.id] do
-      %{hold_reason: :tool_permission, completion_entry: entry} when is_map(entry) ->
-        if terminal_issue_state?(issue.state, terminal_state_set(state)), do: complete_issue(state, issue.id, entry), else: state
+  defp resolve_tool_issue_outcome(state, %Issue{state: name} = issue, entry, attempt, metadata)
+       when is_binary(name) do
+    terminal = terminal_issue_state?(name, terminal_state_set(state))
 
-      _ ->
-        state
+    if String.trim(name) != "" and (terminal or not active_issue_state?(name, active_state_set(state))) do
+      state =
+        if terminal, do: confirm_terminal_tool_outcome(state, issue, entry), else: state
+
+      {:noreply, resolved} = handle_retry_issue_lookup(issue, state, issue.id, attempt, metadata)
+      {:resolved, resolved}
+    else
+      :unresolved
     end
   end
 
-  defp complete_terminal_tool_issue(state, _issue), do: state
+  defp resolve_tool_issue_outcome(_state, _issue, _entry, _attempt, _metadata), do: :unresolved
+
+  defp confirm_terminal_tool_outcome(state, issue, entry) do
+    state = if is_map(entry), do: complete_issue(state, issue.id, entry), else: state
+    confirm_completed_issue(state, issue)
+  end
 
   defp reconcile_tool_permission_results(state, captured, {:ok, issues}) do
     Enum.reduce(issues, state, fn issue, current ->
       retry = current.retry_attempts[issue.id]
 
       if captured[issue.id] != nil and retry != nil and retry.retry_token == captured[issue.id] and
-           retry[:hold_reason] == :tool_permission and terminal_issue_state?(issue.state, terminal_state_set(current)) do
-        current
-        |> complete_terminal_tool_issue(issue)
-        |> confirm_completed_issue(issue)
-        |> release_retry_claim(issue.id)
-        |> queue_issue_cleanup(issue.id, issue.identifier, retry.worker_host)
+           retry[:hold_reason] == :tool_permission do
+        reconcile_tool_permission_issue(current, issue, retry)
       else
         current
       end
@@ -2120,6 +2139,15 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp reconcile_tool_permission_results(state, _captured, _error), do: state
+
+  defp reconcile_tool_permission_issue(state, issue, retry) do
+    metadata = %{worker_host: retry.worker_host}
+
+    case resolve_tool_issue_outcome(state, issue, retry[:completion_entry], retry.attempt, metadata) do
+      {:resolved, resolved} -> resolved
+      :unresolved -> state
+    end
+  end
 
   defp assignment_provider_hold(state, issue, spec) do
     scope = provider_scope(state, spec)

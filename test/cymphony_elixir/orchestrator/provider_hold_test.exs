@@ -24,6 +24,156 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     {:ok, tasks: tasks, ports: ports, cli: cli, root: root}
   end
 
+  test "fresh nonactive workflow handoffs release tool holds without counting or deleting the workspace", ctx do
+    for state_name <- ["Awaiting live proof", "In Review", "Backlog", "Custom excluded state"] do
+      {state, issue} = running_state(ctx)
+      workspace = Path.join(state.config.workspace.root, issue.identifier)
+      File.mkdir_p!(workspace)
+      evidence = Path.join(workspace, "handoff-evidence.txt")
+      File.write!(evidence, "retained")
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: state_name, state_type: "started"}])
+      released = provider_down(state, issue, :tool_permission)
+      assert released.retry_attempts == %{}
+      assert released.provider_holds == %{}
+      refute MapSet.member?(released.claimed, issue.id)
+      assert snapshot(released).completed_count == 0
+      assert File.read!(evidence) == "retained"
+      todo = %{issue | state: "Todo"}
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [todo])
+      assert Orchestrator.should_dispatch_issue_for_test(todo, released)
+    end
+  end
+
+  test "configured workflow route matrix is consistent for fresh failures, manual retries and periodic refresh", ctx do
+    cases = [
+      {"Todo", "started", ["Todo", "In Progress"], ["Done", "Canceled"], :held, 0},
+      {"In Progress", "started", ["Todo", "In Progress"], ["Done", "Canceled"], :held, 0},
+      {"Awaiting live proof", "started", ["Todo", "In Progress"], ["Done", "Canceled"], :handoff, 0},
+      {"In Review", "started", ["Todo", "In Progress"], ["Done", "Canceled"], :handoff, 0},
+      {"Backlog", "unstarted", ["Todo", "In Progress"], ["Done", "Canceled"], :handoff, 0},
+      {"Custom excluded state", "started", ["Todo", "In Progress"], ["Done", "Canceled"], :handoff, 0},
+      {"In Review", "completed", ["Todo", "In Progress"], ["Done", "Canceled"], :handoff, 0},
+      {"Awaiting live proof", "started", ["Todo", "Awaiting live proof"], ["Done", "Canceled"], :held, 0},
+      {"Done", "completed", ["Todo", "In Progress"], ["Done", "Canceled"], :terminal, 1},
+      {"Canceled", "canceled", ["Todo", "In Progress"], ["Done", "Canceled"], :terminal, 0},
+      {"Done", "canceled", ["Todo", "In Progress"], ["Done", "Canceled"], :terminal, 0},
+      {"Custom resolved", "completed", ["Todo"], ["Custom resolved"], :terminal, 1},
+      {"Done", "completed", ["Todo", "In Progress"], ["Closed"], :handoff, 0},
+      {"Todo", "started", ["Working"], ["Closed"], :handoff, 0},
+      {nil, "completed", ["Todo", "In Progress"], ["Done", "Canceled"], :held, 0},
+      {"", "completed", ["Todo", "In Progress"], ["Done", "Canceled"], :held, 0},
+      {"   ", "completed", ["Todo", "In Progress"], ["Done", "Canceled"], :held, 0}
+    ]
+
+    calls = configure_handoff_cli(ctx)
+
+    for paused <- [false, true], phase <- [:initial, :manual, :periodic], scenario <- cases do
+      {name, type, active, terminal, expected, completed_count} = scenario
+      File.rm(calls)
+      configure_workflow(ctx, active, terminal)
+      {state, issue} = running_state(ctx)
+      issue = %{issue | state: hd(active)}
+      entry = %{state.running[issue.id] | issue: issue}
+      state = %{state | running: %{issue.id => entry}, pending_completed_issue_ids: MapSet.new([issue.id]), paused: paused}
+      workspace = Path.join(state.config.workspace.root, issue.identifier)
+      File.mkdir_p!(workspace)
+      evidence = Path.join(workspace, "workflow-handoff.txt")
+      File.write!(evidence, "retained")
+      fresh = %{issue | state: name, state_type: type}
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue])
+
+      result =
+        case phase do
+          :initial ->
+            Application.put_env(:cymphony_elixir, :memory_tracker_issues, [fresh])
+            provider_down(state, issue, :tool_permission)
+
+          later ->
+            held = provider_down(state, issue, :tool_permission)
+            Application.put_env(:cymphony_elixir, :memory_tracker_issues, [fresh])
+
+            if later == :periodic do
+              poll_once(held)
+            else
+              {:reply, :ok, retried} = apply_call({:retry_issue_now, issue.id}, held)
+              if Map.has_key?(retried.running, issue.id), do: await_permission_worker(retried, issue), else: retried
+            end
+        end
+
+      label = inspect({paused, phase, name, active, terminal})
+      assert result.paused == paused, label
+      assert snapshot(result).completed_count == completed_count, label
+      assert result.running == %{}, label
+
+      if expected == :held do
+        assert %{held: true, hold_reason: :tool_permission} = result.retry_attempts[issue.id]
+        assert MapSet.member?(result.claimed, issue.id), label
+        assert map_size(result.provider_holds) == 1, label
+        assert File.read!(evidence) == "retained", label
+      else
+        assert result.retry_attempts == %{}, label
+        assert result.provider_holds == %{}, label
+        refute MapSet.member?(result.claimed, issue.id), label
+        refute MapSet.member?(result.pending_completed_issue_ids, issue.id), label
+
+        if expected == :terminal do
+          refute File.exists?(workspace), label
+        else
+          assert File.read!(evidence) == "retained", label
+          ready = %{issue | state_type: "started"}
+          Application.put_env(:cymphony_elixir, :memory_tracker_issues, [ready])
+          assert Orchestrator.should_dispatch_issue_for_test(ready, %{result | paused: false}), label
+        end
+      end
+
+      expected_calls = if phase == :manual and name in active, do: "call\n", else: ""
+      actual_calls = if File.exists?(calls), do: File.read!(calls), else: ""
+      assert actual_calls == expected_calls, label
+    end
+  end
+
+  test "real ALE-580 style refusal hands off to Awaiting then permits later Todo without another model call", ctx do
+    calls = configure_handoff_cli(ctx)
+    {state, original} = running_state(ctx)
+    issue = %{original | id: "fixture-ALE-580", identifier: "ALE-580"}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue])
+    {:reply, :ok, dispatched} = apply_call({:dispatch_issue_for_test, issue}, %{state | running: %{}, claimed: MapSet.new()})
+    %{ref: ref, pid: pid} = dispatched.running[issue.id]
+    assert_receive {:DOWN, ^ref, :process, ^pid, {%ProviderFailure{kind: :tool_permission}, _}} = message, 5_000
+    workspace = Path.join(state.config.workspace.root, issue.identifier)
+    evidence = Path.join(workspace, "installation-packet.txt")
+    File.write!(evidence, "prepared for another owner")
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: "Awaiting live proof", state_type: "started"}])
+    released = apply_info(message, dispatched)
+    assert released.retry_attempts == %{}
+    assert released.provider_holds == %{}
+    refute MapSet.member?(released.claimed, issue.id)
+    assert snapshot(released).completed_count == 0
+    assert File.read!(evidence) == "prepared for another owner"
+    todo = %{issue | state: "Todo"}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [todo])
+    assert Orchestrator.should_dispatch_issue_for_test(todo, released)
+    assert File.read!(calls) == "call\n"
+  end
+
+  test "an inactive handoff releases only its own tool holds and leaves other real holds intact", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :tool_permission)
+    [{:tool_permission, _, scope}] = Map.keys(held.provider_holds)
+
+    others = %{
+      scope => %{kind: :authentication, retry_at: nil, message: "provider login needed"},
+      {:tool_permission, "other-held-issue", scope} => %{kind: :tool_permission, retry_at: nil, message: "another issue's refusal"}
+    }
+
+    held = %{held | provider_holds: Map.merge(held.provider_holds, others)}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: "Awaiting live proof"}])
+    released = poll_once(held)
+    assert released.retry_attempts == %{}
+    assert released.provider_holds == others
+    assert snapshot(released).completed_count == 0
+  end
+
   test "fresh tracker Done retires a recovered final tool denial and counts completion once", ctx do
     {state, issue} = running_state(ctx)
     completed = %{issue | state: "Done", state_type: "completed"}
@@ -465,6 +615,33 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     }
 
     {state, issue}
+  end
+
+  defp configure_workflow(ctx, active, terminal) do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: active,
+      tracker_terminal_states: terminal,
+      workspace_root: Path.join(ctx.root, "workspaces"),
+      claude_command: ctx.cli,
+      claude_provider: "fixture-provider",
+      agent_model: "fixture-model",
+      poll_interval_ms: 60_000
+    )
+  end
+
+  defp configure_handoff_cli(ctx) do
+    calls = Path.join(ctx.root, "workflow-model-calls")
+
+    File.write!(ctx.cli, """
+    #!/bin/sh
+    printf 'call\\n' >> '#{calls}'
+    cat <<'HANDOFF_TOOL_RESULT'
+    {"type":"result","subtype":"success","is_error":false,"session_id":"handoff-session","num_turns":12,"result":"Published source and prepared the next owner's installation packet","permission_denials":[{"tool_name":"Write","tool_use_id":"toolu_packet","tool_input":{"file_path":"/private/audits/installation-packet.md","content":"fixture"}}]}
+    HANDOFF_TOOL_RESULT
+    """)
+
+    calls
   end
 
   defp provider_down(state, issue, kind, retry_at \\ nil) do

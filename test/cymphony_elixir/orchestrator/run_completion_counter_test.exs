@@ -35,6 +35,16 @@ defmodule CymphonyElixir.Orchestrator.RunCompletionCounterTest do
     assert result.pending_completed_issue_ids == MapSet.new()
   end
 
+  test "a nonterminal workflow handoff cannot count inherited pending completion from its state type", ctx do
+    handoff = issue("configured-handoff", "In Review", "completed")
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [handoff])
+    result = confirm(handoff, state(ctx, [handoff]))
+    assert snapshot(result).completed_count == 0
+    assert result.pending_completed_issue_ids == MapSet.new()
+    assert result.retry_attempts == %{}
+    refute MapSet.member?(result.claimed, handoff.id)
+  end
+
   test "a normal worker turn is pending until tracker completion is independently confirmed", ctx do
     issue = issue("pending", "In Progress", "started")
     state = state(ctx, [])
