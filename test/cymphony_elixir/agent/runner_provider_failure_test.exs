@@ -14,6 +14,41 @@ defmodule CymphonyElixir.Agent.RunnerProviderFailureTest do
     {:ok, test_root: test_root, workspace_root: workspace_root, workspace: workspace, issue: issue}
   end
 
+  test "exit-zero Claude permission result is an actionable hold in the real runner", ctx do
+    configure_cli(ctx, permission_lines(), 0)
+    assert {:error, %{__struct__: ProviderFailure, kind: :permission, retry_at: nil}} = Runner.run(ctx.workspace, "fixture", ctx.issue)
+  end
+
+  test "AgentRunner terminates after one permission refusal without any of its twenty continuations", ctx do
+    calls = configure_cli(ctx, permission_lines(), 0)
+    test_pid = self()
+
+    fetcher = fn _ids ->
+      send(test_pid, :permission_issue_state_fetch)
+      {:ok, [ctx.issue]}
+    end
+
+    {pid, ref} = spawn_monitor(fn -> AgentRunner.run(ctx.issue, nil, max_turns: 20, issue_state_fetcher: fetcher) end)
+    assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 10_000
+    assert File.read!(calls) == "call\n"
+    assert {%ProviderFailure{kind: :permission, retry_at: nil}, stacktrace} = reason
+    assert is_list(stacktrace)
+    refute_receive :permission_issue_state_fetch
+  end
+
+  test "ordinary tool refusal text and malformed denial metadata still allow legitimate continuation", ctx do
+    for denials <- [nil, [], [%{"tool_name" => "Bash"}]] do
+      lines = [
+        ~s({"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"Claude requested permissions that have not been granted yet"}]}}),
+        Jason.encode!(%{"type" => "result", "is_error" => false, "session_id" => "valid-session", "result" => "Continue work", "permission_denials" => denials})
+      ]
+
+      calls = configure_cli(ctx, lines, 0)
+      assert :ok = AgentRunner.run(ctx.issue, nil, max_turns: 2, issue_state_fetcher: fn _ -> {:ok, [ctx.issue]} end)
+      assert File.read!(calls) == "call\ncall\n"
+    end
+  end
+
   test "real runner preserves Claude auth failure on a nonzero CLI exit", ctx do
     configure_cli(ctx, claude_auth_lines(), 1)
     assert {:error, %{__struct__: ProviderFailure, kind: :authentication, retry_at: nil}} = Runner.run(ctx.workspace, "fixture", ctx.issue)
@@ -66,11 +101,20 @@ defmodule CymphonyElixir.Agent.RunnerProviderFailureTest do
     ]
   end
 
+  defp permission_lines do
+    [
+      ~s({"type":"result","subtype":"success","is_error":false,"session_id":"denied-session","num_turns":1,"result":"Waiting for required permissions","permission_denials":[{"tool_name":"mcp__linear__get_issue","tool_use_id":"toolu_denied","tool_input":{"id":"ALE-1406","api_key":"lin_api_PRIVATE"}}]})
+    ]
+  end
+
   defp configure_cli(ctx, lines, status, kind \\ "claude") do
     binary = Path.join(ctx.test_root, "fake-agent")
+    calls = Path.join(ctx.test_root, "calls")
+    File.rm(calls)
 
     File.write!(binary, """
     #!/bin/sh
+    printf 'call\\n' >> '#{calls}'
     cat <<'CYMPHONY_PROVIDER_FIXTURE'
     #{Enum.join(lines, "\n")}
     CYMPHONY_PROVIDER_FIXTURE
@@ -88,5 +132,6 @@ defmodule CymphonyElixir.Agent.RunnerProviderFailureTest do
     ]
 
     write_workflow_file!(Workflow.workflow_file_path(), workflow_opts)
+    calls
   end
 end

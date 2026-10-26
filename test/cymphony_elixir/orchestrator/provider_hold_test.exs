@@ -21,7 +21,74 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
 
     tasks = start_supervised!({Task.Supervisor, []})
     ports = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
-    {:ok, tasks: tasks, ports: ports}
+    {:ok, tasks: tasks, ports: ports, cli: cli, root: root}
+  end
+
+  test "a real permission refusal stays parked and each config change or deliberate retry permits just one probe", ctx do
+    calls = Path.join(ctx.root, "permission-calls")
+
+    File.write!(ctx.cli, """
+    #!/bin/sh
+    printf 'call\\n' >> '#{calls}'
+    cat <<'CYMPHONY_PERMISSION_FIXTURE'
+    {"type":"result","subtype":"success","is_error":false,"session_id":"permission-session","num_turns":1,"result":"Permission required","permission_denials":[{"tool_name":"mcp__linear__get_issue","tool_use_id":"toolu_denied","tool_input":{"id":"ALE-1406","api_key":"lin_api_PRIVATE"}}]}
+    CYMPHONY_PERMISSION_FIXTURE
+    """)
+
+    {state, issue} = running_state(ctx)
+    state = %{state | running: %{}, claimed: MapSet.new()}
+    {:reply, :ok, dispatched} = apply_call({:dispatch_issue_for_test, issue}, state)
+    held = await_permission_worker(dispatched, issue)
+
+    assert %{held: true, hold_reason: :permission, failures: 0, timer_ref: nil} = held.retry_attempts[issue.id]
+    assert File.read!(calls) == "call\n"
+    refute inspect(snapshot(held)) =~ "PRIVATE"
+
+    stable = repeat_provider_wait(held, issue)
+    unrelated_config = %{stable.config | codex: %{stable.config.codex | extra_args: ["--full-auto"]}}
+    unchanged = apply_info(:watchdog, %{stable | config: unrelated_config})
+    assert unchanged.retry_attempts[issue.id] == stable.retry_attempts[issue.id]
+    assert unchanged.running == %{}
+    assert File.read!(calls) == "call\n"
+
+    claude = %{unchanged.config.claude | extra_args: ["--allowedTools", "mcp__linear__*"]}
+    changed = apply_info(:watchdog, %{unchanged | config: %{unchanged.config | claude: claude}})
+    retry = changed.retry_attempts[issue.id]
+    refute retry.held
+    refute retry.retry_token == unchanged.retry_attempts[issue.id].retry_token
+    revalidated = apply_info({:retry_issue, issue.id, retry.retry_token}, changed)
+    held_again = revalidated |> await_permission_worker(issue) |> repeat_provider_wait(issue)
+    assert File.read!(calls) == "call\ncall\n"
+    assert held_again.retry_attempts[issue.id].failures == 0
+
+    {:reply, :ok, probed} = apply_call({:retry_issue_now, issue.id}, %{held_again | paused: true})
+    assert probed.running[issue.id].provider_probe
+    manually_held = probed |> await_permission_worker(issue) |> repeat_provider_wait(issue)
+    assert manually_held.paused
+    assert manually_held.retry_attempts[issue.id].hold_reason == :permission
+    assert manually_held.retry_attempts[issue.id].failures == 0
+    assert File.read!(calls) == "call\ncall\ncall\n"
+  end
+
+  test "Claude permission configuration changes leave another native agent scope held", ctx do
+    {state, issue} = running_state(ctx)
+    other = %{issue | id: "codex-provider-held", identifier: "MT-CODEX-HOLD", labels: ["agent:codex"]}
+
+    other_entry =
+      state.running[issue.id]
+      |> Map.merge(%{issue: other, identifier: other.identifier, ref: make_ref(), pid: spawn(fn -> :ok end), agent_kind: "codex", provider: nil})
+
+    state = %{state | running: Map.put(state.running, other.id, other_entry)}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue, other])
+    held = state |> provider_down(issue, :permission) |> provider_down(other, :authentication)
+    assert map_size(held.provider_holds) == 2
+    other_retry = held.retry_attempts[other.id]
+    claude = %{held.config.claude | permission_mode: "bypassPermissions"}
+    changed = apply_info(:watchdog, %{held | config: %{held.config | claude: claude}})
+
+    refute changed.retry_attempts[issue.id].held
+    assert changed.retry_attempts[other.id] == other_retry
+    assert changed.running == %{}
   end
 
   test "authentication refusal parks native retries without consuming coding failures", ctx do
@@ -211,6 +278,20 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     entry = state.running[issue.id]
     failure = %ProviderFailure{kind: kind, retry_at: retry_at, message: "Provider unavailable; operator action required."}
     apply_info({:DOWN, entry.ref, :process, entry.pid, {failure, []}}, state)
+  end
+
+  defp await_permission_worker(state, issue) do
+    %{ref: ref, pid: pid} = state.running[issue.id]
+    assert_receive {:DOWN, ^ref, :process, ^pid, {%ProviderFailure{kind: :permission}, _stack}} = message, 5_000
+    apply_info(message, state)
+  end
+
+  defp repeat_provider_wait(state, issue) do
+    Enum.reduce(1..4, state, fn _, acc ->
+      retry = acc.retry_attempts[issue.id]
+      acc = apply_info({:retry_issue, issue.id, retry.retry_token}, acc)
+      apply_info(:watchdog, acc)
+    end)
   end
 
   defp snapshot(state) do

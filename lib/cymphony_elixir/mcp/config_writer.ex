@@ -12,6 +12,8 @@ defmodule CymphonyElixir.Mcp.ConfigWriter do
   @descriptor_subpath ".cymphony/mcp_config.json"
   @default_endpoint "https://api.linear.app/graphql"
 
+  alias CymphonyElixir.Mcp.Command
+
   @type tracker_config :: %{
           required(:api_key) => String.t(),
           optional(:endpoint) => String.t() | nil
@@ -28,12 +30,13 @@ defmodule CymphonyElixir.Mcp.ConfigWriter do
       when is_binary(workspace) and is_binary(api_key) and api_key != "" do
     endpoint = Map.get(tracker, :endpoint) || @default_endpoint
     descriptor_path = Path.join(workspace, @descriptor_subpath)
+    {command, args} = Command.build()
 
     descriptor = %{
       "mcpServers" => %{
         "cymphony-linear" => %{
-          "command" => "elixir",
-          "args" => ["-S", "mix", "cymphony.mcp.linear_graphql"],
+          "command" => command,
+          "args" => args,
           "env" => %{
             "LINEAR_API_KEY" => api_key,
             "LINEAR_ENDPOINT" => endpoint

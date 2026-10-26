@@ -22,8 +22,8 @@ defmodule CymphonyElixir.Mcp.ConfigWriterTest do
     refute raw =~ "lin-secret-123\n", "api_key should not appear standalone in args"
 
     %{"mcpServers" => %{"cymphony-linear" => server}} = Jason.decode!(raw)
-    assert server["command"] == "elixir"
-    assert "cymphony.mcp.linear_graphql" in server["args"]
+    assert Path.type(server["command"]) == :absolute
+    refute "mix" in server["args"]
     refute "lin-secret-123" in server["args"]
     assert server["env"]["LINEAR_API_KEY"] == "lin-secret-123"
     assert server["env"]["LINEAR_ENDPOINT"] == "https://lin.example/graphql"

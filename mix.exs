@@ -27,6 +27,8 @@ defmodule CymphonyElixir.MixProject do
           CymphonyElixir.Agent.Runner,
           CymphonyElixir.HttpServer,
           CymphonyElixir.Mcp.LinearGraphqlServer,
+          # Stdio/EOF is exercised in real subprocesses, like the Mix task.
+          CymphonyElixir.Mcp.Stdio,
           CymphonyElixir.StatusDashboard,
           CymphonyElixir.LogFile,
           CymphonyElixir.Workspace,

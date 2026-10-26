@@ -1,16 +1,17 @@
 defmodule CymphonyElixir.Agent.ProviderFailure do
   @moduledoc """
-  An actionable provider refusal, distinct from a failed coding attempt.
+  An actionable provider or tool-permission refusal, distinct from a failed coding attempt.
 
-  Only recognized CLI error envelopes establish a refusal. Tool output, quoted
-  fixtures and ordinary HTTP errors are never searched for provider keywords.
+  Only recognized CLI error envelopes or structured final tool-permission
+  denials establish a refusal. Tool output, quoted fixtures and ordinary HTTP
+  errors are never searched for refusal keywords.
   Raw error payloads stay out of the exception; its message is safe to publish.
   `retry_at` is a Unix millisecond deadline, or nil when operator action is needed.
   """
 
   defexception [:kind, :retry_at, message: "Provider unavailable"]
 
-  @type t :: %__MODULE__{kind: :authentication | :quota, retry_at: integer() | nil, message: String.t()}
+  @type t :: %__MODULE__{kind: :authentication | :quota | :permission, retry_at: integer() | nil, message: String.t()}
 
   @max_line_bytes 262_144
   @max_unix_ms 253_402_300_799_999
@@ -59,14 +60,30 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
   end
 
   defp event_error(%{"type" => "assistant", "isApiErrorMessage" => true, "error" => error}), do: error
-  defp event_error(%{"type" => "result", "is_error" => true} = event), do: event["error"]
-  defp event_error(%{"type" => "result", "is_error" => false}), do: :success
+
+  defp event_error(%{"type" => "result", "is_error" => is_error} = event) when is_boolean(is_error) do
+    cond do
+      permission_denied?(event["permission_denials"]) -> :permission_denied
+      is_error -> event["error"]
+      true -> :success
+    end
+  end
+
   defp event_error(%{"type" => "turn.failed", "error" => error}), do: error
   defp event_error(%{"type" => "turn.completed"}), do: :success
   defp event_error(%{"event" => "error"} = event), do: event["error"] || event
   defp event_error(%{"event" => "result", "result" => %{"status" => "ERROR", "error" => error}}), do: agy_error(error)
   defp event_error(%{"event" => "result", "result" => %{"status" => "SUCCESS"}}), do: :success
   defp event_error(_event), do: nil
+
+  defp permission_denied?([_ | _] = denials), do: Enum.all?(denials, &valid_permission_denial?/1)
+  defp permission_denied?(_denials), do: false
+
+  defp valid_permission_denial?(%{"tool_name" => name, "tool_use_id" => id, "tool_input" => input})
+       when is_binary(name) and is_binary(id) and is_map(input),
+       do: String.trim(name) != "" and String.trim(id) != ""
+
+  defp valid_permission_denial?(_denial), do: false
 
   # This literal is AGY's structured quota refusal, not arbitrary stdout text.
   defp agy_error("Individual quota reached." <> _rest = message),
@@ -75,6 +92,10 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
   defp agy_error(error), do: error
 
   defp failure(code, now_ms) when is_binary(code), do: failure(%{"code" => code}, now_ms)
+
+  defp failure(:permission_denied, _now_ms) do
+    %__MODULE__{kind: :permission, message: "Tool permission denied; grant the required tool permissions, then retry manually."}
+  end
 
   defp failure(%{} = error, now_ms) do
     case error["code"] || error["status"] do

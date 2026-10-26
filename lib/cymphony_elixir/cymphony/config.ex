@@ -1100,9 +1100,9 @@ defmodule CymphonyElixir.Cymphony.Config do
     end
   end
 
-  # Extra CLI args are per-kind pass-through flags, so — like providers — they
-  # belong to the active kind's section only: a project pinned to `codex` must
-  # not inherit the `antigravity` list.
+  # A per-kind map supplies each named agent's own pass-through flags, including
+  # agents selected through issue overrides. The bare-list convenience form is
+  # scoped to the default agent; flags never cross into another kind's section.
   #
   # Two accepted shapes on a `projects[]` entry:
   #
@@ -1114,7 +1114,7 @@ defmodule CymphonyElixir.Cymphony.Config do
   # `Schema.parse/1` and take the whole project down — but unlike a numeric
   # typo, a mistyped escape hatch is invisible, so it is logged.
   defp maybe_put_extra_args(section, config, kind) do
-    if agent_kind(config) == kind do
+    if is_map(Map.get(config, "extra_args")) or agent_kind(config) == kind do
       case extra_args(config, kind) do
         [] -> section
         args -> Map.put(section, "extra_args", args)
@@ -1132,7 +1132,7 @@ defmodule CymphonyElixir.Cymphony.Config do
     end
   end
 
-  # A map with no entry for the active kind is the normal case, not a mistake.
+  # A map with no entry for this kind is the normal case, not a mistake.
   defp kind_extra_args(nil), do: []
   defp kind_extra_args(value), do: string_list_or_warn(value)
 

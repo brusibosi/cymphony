@@ -110,6 +110,18 @@ There must stay exactly one `System.halt/1` call site in `lib/`, inside `CLI.hal
 `~/.cymphony/daemon.log` and rotates it. `LogFileTest` unsets both to exercise the config-dir
 defaults and must **restore** them in `on_exit`, not delete them.
 
+### Linear MCP startup
+
+`cymphony mcp linear-graphql` is a stdio-only CLI route for the injected local
+`cymphony-linear` server. Packaged builds re-execute their own Burrito wrapper
+or escript archive; development uses absolute compiled code paths and Elixir.
+Both Claude descriptors and Codex overrides use `Mcp.Command.build/1`.
+Never run Mix from a bot workspace or require its `WORKFLOW.md` for MCP HTTP
+requests: use `Linear.Client.graphql_opts_for_api_key/2`. `Mcp.Stdio` starts
+only Req dependencies, keeps stdout JSON-RPC-only, sends diagnostics to stderr
+and exits on EOF. The Burrito entry skips all dashboard/orchestrator children
+for this exact route. Keys remain in the server environment, never argv.
+
 ### Concurrency control
 
 ```bash
@@ -266,7 +278,7 @@ CLI → CymphonyConfig → WorkflowStore → Orchestrator (GenServer, per-projec
 
 - Capacity waits perform no retry-related tracker read and preserve coding-attempt/failure counts. Retry refreshes use the exact project-scoped by-ID query; moved or newly blocked issues are not dispatched.
 - `Linear.RateLimit` shares HTTP 429/explicit GraphQL rate-limit cooldowns across projects using the same endpoint and hashed authorization. Retry-After takes precedence over the native initial-backoff fallback. It is node-local; existing in-flight requests may finish and daemon restart clears the registry.
-- `Agent.ProviderFailure` accepts only recognized CLI error envelopes, not words inside tool/test output. Typed authentication/quota refusals reach the orchestrator and park the affected assignment; unknown resets need manual action. Holds do not consume the coding-failure budget. Config/run-spec changes and known expiry are rechecked by the watchdog; explicit Retry may probe while paused but cannot bypass Linear cooldowns.
+- `Agent.ProviderFailure` accepts recognized CLI error envelopes and well-formed final Claude `permission_denials`, not words inside tool/test output. Typed authentication/quota/tool-permission refusals park the affected assignment before another continuation. Permission holds retain no raw tool inputs and require a relevant agent-configuration/run-spec change or deliberate Retry; unchanged holds make no further agent calls. Holds do not consume the coding-failure budget. Config/run-spec changes and known expiry are rechecked by the watchdog; explicit Retry may probe while paused but cannot bypass Linear cooldowns.
 - `snapshot.completed_count` -> API `projects[].completed_count` / aggregate `counts.completed` is an uncapped set of distinct tracker-confirmed completed issue IDs for the current project run. A normal agent turn only becomes a pending completion until the tracker confirms completion. Canceled/duplicate/active issues do not count. Paused->Resume and fresh runtime startup reset that project's set; repeated Resume, page refreshes and worker retries do not. Prior-run worker completions cannot enter a restarted run.
 - The most recent 100 agent-run records remain a bounded durable history and are never used as the ticket counter. `MIX_ENV=test` pins the completion store as well as both log sinks to private test storage.
 
@@ -301,12 +313,12 @@ route, no dashboard control.
   "extra_args": ["--add-dir", "/srv/shared"]
   ```
 
-  A map is keyed by agent kind and **only the active kind's list is emitted**, into that kind's
-  generated section — a project pinned to `codex` must never inherit the `antigravity` list. A
-  bare list is the convenience form and applies to the active kind. Like providers, this is a
-  per-kind setting, so it never lands in a section other than the active one — which also means
-  per-issue overrides (an `agent:` label, a queue pin, a dashboard restart) run **without** any
-  `extra_args`, exactly as they run without provider keys.
+  A map is keyed by agent kind and **each configured list is emitted into its own matching
+  section**, so per-issue overrides (`agent:` labels, queue pins and dashboard restarts) retain
+  that agent's flags. A project whose default is `codex` can therefore explicitly configure
+  Claude's Linear tool permissions without passing Claude flags to Codex. A bare list remains
+  the convenience form for the default kind only. Provider aliases remain scoped to the
+  default kind; this map behavior does not move provider credentials between agents.
   Trust boundary: `extra_args` is operator-authored, hand-edited config and is treated as
   trusted — the string form is interpolated into the launch script raw (it can carry its own
   quoting, which also means it can carry arbitrary shell), and nothing validates that a flag

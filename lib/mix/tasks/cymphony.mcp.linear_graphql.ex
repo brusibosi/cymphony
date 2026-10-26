@@ -14,43 +14,12 @@ defmodule Mix.Tasks.Cymphony.Mcp.LinearGraphql do
 
   use Mix.Task
 
-  alias CymphonyElixir.Mcp.LinearGraphqlServer
+  alias CymphonyElixir.Mcp.Stdio
 
   @shortdoc false
 
   @impl Mix.Task
   def run(_args) do
-    Application.ensure_all_started(:cymphony_elixir)
-
-    LinearGraphqlServer.log_started(%{workspace_path: File.cwd!()})
-
-    env = LinearGraphqlServer.env_from_system()
-    loop(env)
-  end
-
-  defp loop(env) do
-    case IO.read(:stdio, :line) do
-      :eof ->
-        :ok
-
-      {:error, _reason} ->
-        :ok
-
-      data when is_binary(data) ->
-        line = String.trim_trailing(data)
-
-        if line != "" do
-          handle_line(line, env)
-        end
-
-        loop(env)
-    end
-  end
-
-  defp handle_line(line, env) do
-    case LinearGraphqlServer.handle_message(line, env) do
-      :no_reply -> :ok
-      response when is_binary(response) -> IO.puts(response)
-    end
+    Stdio.run()
   end
 end
