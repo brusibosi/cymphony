@@ -5,13 +5,28 @@ defmodule CymphonyElixir.Agent.ProviderFailureTest do
 
   @now_ms 1_800_000_000_000
 
+  test "genuine structured provider permission errors remain distinct from individual tool denials" do
+    for code <- ["permission_error", "permission_denied"] do
+      assert %{kind: :permission} = classify([Jason.encode!(%{"type" => "result", "is_error" => true, "error" => %{"code" => code}})])
+      event = %{"type" => "result", "is_error" => true, "error" => %{"code" => code}, "permission_denials" => [permission_denial()]}
+      assert %{kind: :permission} = classify([Jason.encode!(event)])
+    end
+  end
+
+  test "unknown final errors cannot hide a valid tool denial" do
+    for error <- ["ordinary_error", %{"code" => "ordinary_error"}, %{"message" => "permission_error"}] do
+      event = %{"type" => "result", "is_error" => true, "error" => error, "permission_denials" => [permission_denial()]}
+      assert %{kind: :tool_permission} = classify([Jason.encode!(event)])
+    end
+  end
+
   test "Claude final permission denials hold an exit-zero result before success resets" do
     denial = permission_denial()
 
     for is_error <- [false, true] do
       event = %{"type" => "result", "is_error" => is_error, "permission_denials" => [denial], "result" => "Waiting for permissions"}
-      assert %{__struct__: ProviderFailure, kind: :permission, retry_at: nil, message: message} = classify([Jason.encode!(event)])
-      assert message =~ "permission"
+      assert %{__struct__: ProviderFailure, kind: :tool_permission, retry_at: nil, message: message} = classify([Jason.encode!(event)])
+      assert message =~ "refused"
       assert message =~ "retry manually"
       refute inspect(message) =~ "PRIVATE"
       refute message =~ "toolu_private"
@@ -56,7 +71,7 @@ defmodule CymphonyElixir.Agent.ProviderFailureTest do
 
   test "permission hold keeps only an actionable message and no denied tool input" do
     event = %{"type" => "result", "is_error" => false, "permission_denials" => [permission_denial(), permission_denial()]}
-    assert %{kind: :permission, message: message} = failure = classify([Jason.encode!(event)])
+    assert %{kind: :tool_permission, message: message} = failure = classify([Jason.encode!(event)])
     assert String.valid?(message)
     assert byte_size(message) <= 512
     refute inspect(failure) =~ "PRIVATE"

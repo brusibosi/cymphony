@@ -11,12 +11,17 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
 
   defexception [:kind, :retry_at, message: "Provider unavailable"]
 
-  @type t :: %__MODULE__{kind: :authentication | :quota | :permission, retry_at: integer() | nil, message: String.t()}
+  @type t :: %__MODULE__{
+          kind: :authentication | :quota | :permission | :tool_permission,
+          retry_at: integer() | nil,
+          message: String.t()
+        }
 
   @max_line_bytes 262_144
   @max_unix_ms 253_402_300_799_999
   @authentication_codes ["authentication_failed", "authentication_error", "invalid_api_key", "unauthenticated"]
   @quota_codes ["resource_exhausted", "quota_exceeded", "insufficient_quota", "usage_limit_reached"]
+  @permission_codes ["permission_denied", "permission_error"]
 
   @doc "Classifies chronological CLI JSON lines before public excerpt redaction."
   @spec classify([term()], integer()) :: t() | nil
@@ -63,6 +68,7 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
 
   defp event_error(%{"type" => "result", "is_error" => is_error} = event) when is_boolean(is_error) do
     cond do
+      is_error and provider_error?(event["error"]) -> event["error"]
       permission_denied?(event["permission_denials"]) -> :permission_denied
       is_error -> event["error"]
       true -> :success
@@ -75,6 +81,13 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
   defp event_error(%{"event" => "result", "result" => %{"status" => "ERROR", "error" => error}}), do: agy_error(error)
   defp event_error(%{"event" => "result", "result" => %{"status" => "SUCCESS"}}), do: :success
   defp event_error(_event), do: nil
+
+  defp provider_error?(%{} = error), do: provider_error?(error["code"] || error["status"])
+
+  defp provider_error?(code) when is_binary(code),
+    do: String.downcase(code) in (@authentication_codes ++ @quota_codes ++ @permission_codes)
+
+  defp provider_error?(_error), do: false
 
   defp permission_denied?([_ | _] = denials), do: Enum.all?(denials, &valid_permission_denial?/1)
   defp permission_denied?(_denials), do: false
@@ -94,7 +107,7 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
   defp failure(code, now_ms) when is_binary(code), do: failure(%{"code" => code}, now_ms)
 
   defp failure(:permission_denied, _now_ms) do
-    %__MODULE__{kind: :permission, message: "Tool permission denied; grant the required tool permissions, then retry manually."}
+    %__MODULE__{kind: :tool_permission, message: "A tool action was refused; correct the command or scoped access, then retry manually."}
   end
 
   defp failure(%{} = error, now_ms) do
@@ -108,6 +121,10 @@ defmodule CymphonyElixir.Agent.ProviderFailure do
 
   defp failure_for_code(code, _error, _now_ms) when code in @authentication_codes do
     %__MODULE__{kind: :authentication, message: "Provider authentication failed; sign in or correct credentials, then retry manually."}
+  end
+
+  defp failure_for_code(code, _error, _now_ms) when code in @permission_codes do
+    %__MODULE__{kind: :permission, message: "Provider permission denied; correct provider access, then retry manually."}
   end
 
   defp failure_for_code(code, error, now_ms) when code in @quota_codes do
