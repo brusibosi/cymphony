@@ -16,7 +16,7 @@ defmodule CymphonyElixir.Agent.RunnerProviderFailureTest do
 
   test "exit-zero Claude permission result is an actionable hold in the real runner", ctx do
     configure_cli(ctx, permission_lines(), 0)
-    assert {:error, %{__struct__: ProviderFailure, kind: :permission, retry_at: nil}} = Runner.run(ctx.workspace, "fixture", ctx.issue)
+    assert {:error, %{__struct__: ProviderFailure, kind: :tool_permission, retry_at: nil}} = Runner.run(ctx.workspace, "fixture", ctx.issue)
   end
 
   test "AgentRunner terminates after one permission refusal without any of its twenty continuations", ctx do
@@ -31,7 +31,7 @@ defmodule CymphonyElixir.Agent.RunnerProviderFailureTest do
     {pid, ref} = spawn_monitor(fn -> AgentRunner.run(ctx.issue, nil, max_turns: 20, issue_state_fetcher: fetcher) end)
     assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 10_000
     assert File.read!(calls) == "call\n"
-    assert {%ProviderFailure{kind: :permission, retry_at: nil}, stacktrace} = reason
+    assert {%ProviderFailure{kind: :tool_permission, retry_at: nil}, stacktrace} = reason
     assert is_list(stacktrace)
     refute_receive :permission_issue_state_fetch
   end

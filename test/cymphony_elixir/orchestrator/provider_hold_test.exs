@@ -24,6 +24,199 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     {:ok, tasks: tasks, ports: ports, cli: cli, root: root}
   end
 
+  test "fresh tracker Done retires a recovered final tool denial and counts completion once", ctx do
+    {state, issue} = running_state(ctx)
+    completed = %{issue | state: "Done", state_type: "completed"}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [completed])
+    entry = state.running[issue.id]
+
+    failure =
+      ProviderFailure.classify(
+        [
+          ~s({"type":"result","is_error":false,"result":"Work finished after recovering from an earlier tool denial","permission_denials":[{"tool_name":"Write","tool_use_id":"toolu_earlier","tool_input":{"file_path":"/private/audit.py","content":"fixture"}}]})
+        ],
+        System.system_time(:millisecond)
+      )
+
+    message = {:DOWN, entry.ref, :process, entry.pid, {failure, []}}
+    reconciled = apply_info(message, state)
+    assert snapshot(reconciled).completed_count == 1
+    assert reconciled.retry_attempts == %{}
+    assert reconciled.provider_holds == %{}
+    assert reconciled.running == %{}
+    assert snapshot(apply_info(message, reconciled)).completed_count == 1
+  end
+
+  test "an active issue tool denial leaves the same provider available to unrelated issues", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :tool_permission)
+    sibling = %{issue | id: "same-assignment-other-issue", identifier: "MT-TOOL-SIBLING"}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue, sibling])
+    assert %{hold_reason: :tool_permission, held: true, failures: 0} = held.retry_attempts[issue.id]
+    assert [{:tool_permission, id, _scope}] = Map.keys(held.provider_holds)
+    assert id == issue.id
+    refute Orchestrator.should_dispatch_issue_for_test(issue, held)
+    assert Orchestrator.should_dispatch_issue_for_test(sibling, held)
+    {:reply, :ok, dispatched} = apply_call({:dispatch_issue_for_test, sibling}, held)
+    assert is_pid(dispatched.running[sibling.id].pid)
+    assert snapshot(dispatched).completed_count == 0
+  end
+
+  test "the failure path awaits fresh terminal state before establishing a permission hold", ctx do
+    {state, issue} = running_state(ctx)
+    config = %{state.config | tracker: %{state.config.tracker | kind: "linear", endpoint: blocked_terminal_tracker(issue)}}
+    entry = state.running[issue.id]
+    failure = %ProviderFailure{kind: :tool_permission, message: "earlier tool refusal"}
+    {:noreply, checking} = Orchestrator.handle_info({:DOWN, entry.ref, :process, entry.pid, {failure, []}}, %{state | config: config})
+    assert_receive {:tool_state_waiting, request}, 2_000
+    assert checking.provider_holds == %{}
+    assert checking.retry_attempts == %{}
+    assert MapSet.member?(checking.claimed, issue.id)
+    send(request, :return_tool_done)
+    reconciled = await_io(checking)
+    assert snapshot(reconciled).completed_count == 1
+    assert reconciled.provider_holds == %{}
+    assert reconciled.retry_attempts == %{}
+  end
+
+  test "a timed-out initial tracker check parks only its issue and retains ownership", ctx do
+    {state, issue} = running_state(ctx)
+    config = %{state.config | tracker: %{state.config.tracker | kind: "linear", endpoint: blocked_terminal_tracker(issue)}}
+    entry = state.running[issue.id]
+    failure = %ProviderFailure{kind: :tool_permission, message: "earlier tool refusal"}
+    {:noreply, checking} = Orchestrator.handle_info({:DOWN, entry.ref, :process, entry.pid, {failure, []}}, %{state | config: config})
+    assert_receive {:tool_state_waiting, request}, 2_000
+    {ref, _job} = Enum.find(checking.work.io_jobs, fn {_ref, job} -> job.key == {:effect, {:tool_permission, issue.id}} end)
+    {:noreply, timed_out} = Orchestrator.handle_info({:io_timeout, ref}, checking)
+    send(request, :return_tool_done)
+    held = await_io(timed_out)
+    assert %{held: true, hold_reason: :tool_permission, failures: 0, timer_ref: nil} = held.retry_attempts[issue.id]
+    assert MapSet.member?(held.claimed, issue.id)
+    assert snapshot(held).completed_count == 0
+    assert held.work.tool_permission_checks == %{}
+  end
+
+  test "real runner cumulative Bash and Write denials reconcile fresh Done after one CLI invocation", ctx do
+    calls = Path.join(ctx.root, "completed-tool-calls")
+
+    File.write!(ctx.cli, """
+    #!/bin/sh
+    printf 'call\\n' >> '#{calls}'
+    cat <<'RECOVERED_TOOL_RESULT'
+    {"type":"result","subtype":"success","is_error":false,"session_id":"recovered-718-1400","num_turns":47,"result":"Recovered and finished assigned work","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_earlier_rm","tool_input":{"command":"rm -f $D/*.log"}},{"tool_name":"Write","tool_use_id":"toolu_earlier_write","tool_input":{"file_path":"/private/audits/probe.py","content":"fixture"}}]}
+    RECOVERED_TOOL_RESULT
+    """)
+
+    {state, issue} = running_state(ctx)
+    {:reply, :ok, dispatched} = apply_call({:dispatch_issue_for_test, issue}, %{state | running: %{}, claimed: MapSet.new()})
+    %{ref: ref, pid: pid} = dispatched.running[issue.id]
+    assert_receive {:DOWN, ^ref, :process, ^pid, {%ProviderFailure{kind: :tool_permission}, _}} = message, 5_000
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: "Done", state_type: "completed"}])
+    reconciled = apply_info(message, dispatched)
+    assert File.read!(calls) == "call\n"
+    assert snapshot(reconciled).completed_count == 1
+    assert reconciled.retry_attempts == %{}
+    assert reconciled.provider_holds == %{}
+    assert length(reconciled.recent_completed) == 1
+    assert apply_info(message, reconciled).recent_completed == reconciled.recent_completed
+    assert File.read!(calls) == "call\n"
+  end
+
+  test "genuine provider permission refusals still hold the shared assignment", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :permission)
+    sibling = %{issue | id: "provider-permission-sibling", identifier: "MT-API-PERMISSION"}
+    refute Orchestrator.should_dispatch_issue_for_test(sibling, held)
+    assert held.retry_attempts[issue.id].hold_reason == :permission
+    assert [{"claude", "fixture-provider", "fixture-model", _fingerprint}] = Map.keys(held.provider_holds)
+  end
+
+  test "a held issue later Done is retired by ordinary periodic reconciliation even while paused", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :tool_permission)
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: "Done", state_type: "completed"}])
+    reconciled = poll_once(%{held | paused: true})
+    assert reconciled.paused
+    assert snapshot(reconciled).completed_count == 1
+    assert reconciled.retry_attempts == %{}
+    assert reconciled.provider_holds == %{}
+    assert reconciled.running == %{}
+    assert snapshot(poll_once(reconciled)).completed_count == 1
+  end
+
+  test "manual terminal revalidation retires the issue hold and counts Done without an agent probe", ctx do
+    {state, issue} = running_state(ctx)
+    held = provider_down(state, issue, :tool_permission)
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: "Done", state_type: "completed"}])
+    {:reply, :ok, reconciled} = apply_call({:retry_issue_now, issue.id}, %{held | paused: true})
+    assert snapshot(reconciled).completed_count == 1
+    assert reconciled.retry_attempts == %{}
+    assert reconciled.provider_holds == %{}
+    assert reconciled.running == %{}
+  end
+
+  test "other terminal states retire tool holds without being counted as Done", ctx do
+    for {state_name, type} <- [{"Canceled", "canceled"}, {"Duplicate", "canceled"}, {"Done", "canceled"}] do
+      {state, issue} = running_state(ctx)
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: state_name, state_type: type}])
+      reconciled = provider_down(state, issue, :tool_permission)
+      assert snapshot(reconciled).completed_count == 0
+      assert reconciled.retry_attempts == %{}
+      assert reconciled.provider_holds == %{}
+    end
+  end
+
+  test "missing tracker visibility cannot be mistaken for completion or clear a tool hold", ctx do
+    {state, issue} = running_state(ctx)
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [])
+    held = provider_down(state, issue, :tool_permission)
+    assert held.retry_attempts[issue.id].held
+    assert snapshot(held).completed_count == 0
+    assert map_size(held.provider_holds) == 1
+    assert poll_once(held).retry_attempts[issue.id].held
+
+    {:reply, :ok, retried} = apply_call({:retry_issue_now, issue.id}, held)
+    assert %{held: true, hold_reason: :tool_permission, failures: 0, timer_ref: nil} = retried.retry_attempts[issue.id]
+    assert retried.provider_holds == held.provider_holds
+    assert MapSet.member?(retried.claimed, issue.id)
+  end
+
+  test "tracker failure preserves a real issue hold without fabricating completion", ctx do
+    {state, issue} = running_state(ctx)
+    parent = self()
+
+    plug = fn conn, _opts ->
+      send(parent, :tool_permission_tracker_read)
+      conn |> Plug.Conn.put_resp_content_type("application/json") |> Plug.Conn.send_resp(200, Jason.encode!(%{"errors" => [%{"message" => "fixture tracker unavailable"}]}))
+    end
+
+    server = start_supervised!({Bandit, plug: plug, port: 0, ip: {127, 0, 0, 1}, startup_log: false})
+    {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(server)
+    config = %{state.config | tracker: %{state.config.tracker | kind: "linear", endpoint: "http://127.0.0.1:#{port}/graphql"}}
+    held = provider_down(%{state | config: config}, issue, :tool_permission)
+    assert_receive :tool_permission_tracker_read
+    assert snapshot(held).completed_count == 0
+    assert %{held: true, hold_reason: :tool_permission, failures: 0} = held.retry_attempts[issue.id]
+    assert map_size(held.provider_holds) == 1
+    assert held.running == %{}
+
+    {:reply, :ok, retried} = apply_call({:retry_issue_now, issue.id}, held)
+    assert %{held: true, hold_reason: :tool_permission, failures: 0, timer_ref: nil} = retried.retry_attempts[issue.id]
+    assert snapshot(retried).completed_count == 0
+    assert retried.provider_holds == held.provider_holds
+  end
+
+  test "a prior-run tool denial cannot inflate a restarted run count", ctx do
+    {state, issue} = running_state(ctx)
+    entry = Map.put(state.running[issue.id], :completion_run_id, make_ref())
+    state = %{state | running: %{issue.id => entry}, work: Map.put(state.work, :completion_run_id, make_ref())}
+    Application.put_env(:cymphony_elixir, :memory_tracker_issues, [%{issue | state: "Done", state_type: "completed"}])
+    reconciled = provider_down(state, issue, :tool_permission)
+    assert snapshot(reconciled).completed_count == 0
+    assert reconciled.retry_attempts == %{}
+    assert reconciled.provider_holds == %{}
+  end
+
   test "a real permission refusal stays parked and each config change or deliberate retry permits just one probe", ctx do
     calls = Path.join(ctx.root, "permission-calls")
 
@@ -40,7 +233,7 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     {:reply, :ok, dispatched} = apply_call({:dispatch_issue_for_test, issue}, state)
     held = await_permission_worker(dispatched, issue)
 
-    assert %{held: true, hold_reason: :permission, failures: 0, timer_ref: nil} = held.retry_attempts[issue.id]
+    assert %{held: true, hold_reason: :tool_permission, failures: 0, timer_ref: nil} = held.retry_attempts[issue.id]
     assert File.read!(calls) == "call\n"
     refute inspect(snapshot(held)) =~ "PRIVATE"
 
@@ -65,7 +258,7 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
     assert probed.running[issue.id].provider_probe
     manually_held = probed |> await_permission_worker(issue) |> repeat_provider_wait(issue)
     assert manually_held.paused
-    assert manually_held.retry_attempts[issue.id].hold_reason == :permission
+    assert manually_held.retry_attempts[issue.id].hold_reason == :tool_permission
     assert manually_held.retry_attempts[issue.id].failures == 0
     assert File.read!(calls) == "call\ncall\ncall\n"
   end
@@ -80,7 +273,7 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
 
     state = %{state | running: Map.put(state.running, other.id, other_entry)}
     Application.put_env(:cymphony_elixir, :memory_tracker_issues, [issue, other])
-    held = state |> provider_down(issue, :permission) |> provider_down(other, :authentication)
+    held = state |> provider_down(issue, :tool_permission) |> provider_down(other, :authentication)
     assert map_size(held.provider_holds) == 2
     other_retry = held.retry_attempts[other.id]
     claude = %{held.config.claude | permission_mode: "bypassPermissions"}
@@ -282,7 +475,7 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
 
   defp await_permission_worker(state, issue) do
     %{ref: ref, pid: pid} = state.running[issue.id]
-    assert_receive {:DOWN, ^ref, :process, ^pid, {%ProviderFailure{kind: :permission}, _stack}} = message, 5_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, {%ProviderFailure{kind: :tool_permission}, _stack}} = message, 5_000
     apply_info(message, state)
   end
 
@@ -292,6 +485,35 @@ defmodule CymphonyElixir.Orchestrator.ProviderHoldTest do
       acc = apply_info({:retry_issue, issue.id, retry.retry_token}, acc)
       apply_info(:watchdog, acc)
     end)
+  end
+
+  defp poll_once(state) do
+    state = apply_info(:tick, state)
+    apply_info(:run_poll_cycle, state)
+  end
+
+  defp blocked_terminal_tracker(issue) do
+    parent = self()
+
+    plug = fn conn, _opts ->
+      send(parent, {:tool_state_waiting, self()})
+      receive do: (:return_tool_done -> :ok)
+
+      node = %{
+        "id" => issue.id,
+        "identifier" => issue.identifier,
+        "title" => issue.title,
+        "state" => %{"name" => "Done", "type" => "completed"},
+        "labels" => %{"nodes" => []},
+        "inverseRelations" => %{"nodes" => []}
+      }
+
+      conn |> Plug.Conn.put_resp_content_type("application/json") |> Plug.Conn.send_resp(200, Jason.encode!(%{"data" => %{"issues" => %{"nodes" => [node]}}}))
+    end
+
+    server = start_supervised!({Bandit, plug: plug, port: 0, ip: {127, 0, 0, 1}, startup_log: false})
+    {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(server)
+    "http://127.0.0.1:#{port}/graphql"
   end
 
   defp snapshot(state) do
