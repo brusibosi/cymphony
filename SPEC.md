@@ -945,8 +945,12 @@ Important nuance:
 - A successful worker exit does not mean the issue is done forever.
 - The worker may continue through multiple back-to-back coding-agent turns before it exits.
 - After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker should start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
+- If the issue is still in an active state and passes the native Todo dependency gate, the worker
+  should start another turn on the same live coding-agent thread in the same workspace, up to
+  `agent.max_turns`. A fresh Todo with any non-terminal or unknown blocker ends the worker's turn
+  loop. Running-state reconciliation also retires that worker without deleting its workspace or
+  counting the issue complete; dispatch can resume when its blockers become terminal. In-progress
+  phases retain their existing eligibility even when blockers remain open.
 - The first turn should use the full rendered task prompt.
 - Continuation turns should send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.

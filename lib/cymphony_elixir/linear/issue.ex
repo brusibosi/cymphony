@@ -42,4 +42,27 @@ defmodule CymphonyElixir.Linear.Issue do
   def label_names(%__MODULE__{labels: labels}) do
     labels
   end
+
+  @doc """
+  Native Todo dependency gate shared by dispatch, continuation and reconciliation.
+
+  Terminal state names are normalized in the supplied set. Unknown blockers hold
+  Todo; an in-progress phase may continue while its predecessors remain open.
+  """
+  @spec todo_blocked_by_non_terminal?(t(), MapSet.t(String.t())) :: boolean()
+  def todo_blocked_by_non_terminal?(%__MODULE__{state: state, blocked_by: blockers}, terminal_states)
+      when is_binary(state) and is_list(blockers) do
+    normalize_state(state) == "todo" and
+      Enum.any?(blockers, fn
+        %{state: blocker_state} when is_binary(blocker_state) ->
+          not MapSet.member?(terminal_states, normalize_state(blocker_state))
+
+        _ ->
+          true
+      end)
+  end
+
+  def todo_blocked_by_non_terminal?(_issue, _terminal_states), do: false
+
+  defp normalize_state(state), do: state |> String.trim() |> String.downcase()
 end
