@@ -936,6 +936,11 @@ defmodule CymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
+      Issue.todo_blocked_by_non_terminal?(issue, terminal_states) ->
+        Logger.info("Issue returned to blocked Todo: #{issue_context(issue)}; stopping active agent")
+
+        terminate_running_issue(state, issue.id, false)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
@@ -1126,7 +1131,7 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp waiting_eligible?(%Issue{} = issue, %State{} = state, active_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !Issue.todo_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(state.claimed, issue.id) and
       !Map.has_key?(state.running, issue.id) and
       !Map.has_key?(state.retry_attempts, issue.id) and
@@ -1201,7 +1206,7 @@ defmodule CymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !Issue.todo_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       not Map.has_key?(state.work.restarts, issue.id) and
@@ -1261,33 +1266,6 @@ defmodule CymphonyElixir.Orchestrator do
        do: assigned_to_worker
 
   defp issue_routable_to_worker?(_issue), do: true
-
-  # Implements the dispatch rule from openai/symphony SPEC §8.2:
-  # > "If state is `Todo`, do not dispatch when any blocker is non-terminal."
-  #
-  # A blocker is considered non-terminal when its state name (case-insensitive,
-  # normalized via `normalize_issue_state/1`) is not in `terminal_states`. The
-  # rule applies only when the issue itself is in the Todo state — issues
-  # already in progress are allowed to run even when blockers remain open, so
-  # an in-flight worker can finish what it started.
-  #
-  # Returns `true` when the issue should NOT be dispatched, `false` otherwise.
-  defp todo_issue_blocked_by_non_terminal?(
-         %Issue{state: issue_state, blocked_by: blockers},
-         terminal_states
-       )
-       when is_binary(issue_state) and is_list(blockers) do
-    normalize_issue_state(issue_state) == "todo" and
-      Enum.any?(blockers, fn
-        %{state: blocker_state} when is_binary(blocker_state) ->
-          !terminal_issue_state?(blocker_state, terminal_states)
-
-        _ ->
-          true
-      end)
-  end
-
-  defp todo_issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -3192,7 +3170,7 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, active_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+      !Issue.todo_blocked_by_non_terminal?(issue, terminal_states)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

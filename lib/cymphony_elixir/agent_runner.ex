@@ -241,7 +241,8 @@ defmodule CymphonyElixir.AgentRunner do
        when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state, config) do
+        if active_issue_state?(refreshed_issue.state, config) and
+             not Issue.todo_blocked_by_non_terminal?(refreshed_issue, terminal_state_set(config)) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -268,6 +269,11 @@ defmodule CymphonyElixir.AgentRunner do
   end
 
   defp active_issue_state?(_state_name, _config), do: false
+
+  defp terminal_state_set(config) do
+    settings = config || Config.settings!()
+    MapSet.new(settings.tracker.terminal_states, &normalize_issue_state/1)
+  end
 
   defp selected_worker_host(nil, []), do: nil
 
